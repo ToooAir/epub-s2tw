@@ -1,6 +1,7 @@
-# epub-translator
+# epub-s2tw
 
-將簡體中文 EPUB 翻譯為繁體中文，支援免費版 Google 翻譯與官方 Cloud Translation API。
+將簡體中文 EPUB 轉換為繁體中文（台灣用語），適合閱讀簡中電子書的繁中讀者使用。
+使用 Google 翻譯進行簡繁轉換與詞彙在地化，支援免費模式與官方 Cloud Translation API。
 
 > **免責聲明**：免費模式使用 Google 未公開的非官方端點，可能隨時失效或違反服務條款，請自行評估風險。
 
