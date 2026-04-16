@@ -22,7 +22,11 @@ import argparse
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", category=UserWarning, module="ebooklib")
+warnings.filterwarnings("ignore", category=FutureWarning, module="ebooklib")
 
 from dotenv import load_dotenv
 from tqdm import tqdm
