@@ -13,6 +13,9 @@ EPUB 讀取、文字抽取、翻譯替換、儲存。
   5. 更新 OPF metadata（dc:title, dc:description 等）
 """
 
+import re
+import zipfile
+
 from bs4 import BeautifulSoup
 import ebooklib
 from ebooklib import epub
@@ -81,6 +84,14 @@ def process_xhtml(content: bytes, translator) -> bytes:
             if text.strip():
                 plain_segs.append((tag, text))
 
+    # 抽取 <head><title> 供後續翻譯（<title> 不在 BLOCK_TAGS，需單獨處理）
+    title_tag  = soup.find('title')
+    title_text = title_tag.get_text().strip() if title_tag else None
+
+    # 沒有任何可翻譯內容，直接回傳原始 bytes，避免不必要的重新序列化
+    if not plain_segs and not html_segs and not title_text:
+        return content
+
     # 純文字批次翻譯
     if plain_segs:
         texts      = [t for _, t in plain_segs]
@@ -95,7 +106,23 @@ def process_xhtml(content: bytes, translator) -> bytes:
         for (tag, _), new_html in zip(html_segs, translated_html):
             _replace_inner_html(tag, new_html)
 
-    return str(soup).encode("utf-8")
+    result = str(soup)
+    # lxml-xml 會把 SVG 的 viewBox 小寫化，需還原（SVG 屬性大小寫敏感）
+    result = re.sub(r'\bviewbox\b', 'viewBox', result)
+    # lxml-xml 序列化時會丟掉 <head> 內的 <link>/<meta>，還原成原始 head
+    # 注意：lxml-xml 輸出空 head 為 <head/>（self-closing），需同時匹配兩種形式
+    HEAD_PAT = re.compile(r'<head(?:\s[^>]*)?(?:/>|>.*?</head>)', re.DOTALL | re.IGNORECASE)
+    orig_head = HEAD_PAT.search(decoded)
+    if orig_head:
+        result = HEAD_PAT.sub(orig_head.group(0), result, count=1)
+
+    # HEAD_PAT 還原了原始 head（含未翻譯 title），此處將 title 替換為翻譯版本
+    if title_text:
+        translated_title = translator.translate(title_text)
+        TITLE_PAT = re.compile(r'(<title[^>]*>)\s*.*?\s*(</title>)', re.DOTALL | re.IGNORECASE)
+        result = TITLE_PAT.sub(rf'\g<1>{translated_title}\g<2>', result, count=1)
+
+    return result.encode("utf-8")
 
 
 # ── EpubProcessor ──────────────────────────────────────────────────────
@@ -105,11 +132,18 @@ class EpubProcessor:
     def __init__(self, path: str):
         self.path = path
         self.book = epub.read_epub(path, {"ignore_ncx": False})
+        # 保留原始 ZIP，讓 process_xhtml 能拿到未經 ebooklib 解析的 raw bytes
+        self._zipfile = zipfile.ZipFile(path, "r")
+        # 推算 EPUB content 根目錄（OPF 所在資料夾，通常是 OEBPS/ 或 EPUB/）
+        opf_candidates = [n for n in self._zipfile.namelist() if n.endswith(".opf")]
+        opf_dir = opf_candidates[0].rsplit("/", 1)[0] + "/" if opf_candidates else ""
+        self._epub_root = opf_dir  # e.g. "OEBPS/"
 
     def translate(self, translator, verbose: bool = False):
         """翻譯整本 EPUB 的 HTML 文件與 metadata。"""
         docs = [i for i in self.book.get_items()
-                if i.get_type() in (ebooklib.ITEM_DOCUMENT, ebooklib.ITEM_NAVIGATION)]
+                if i.get_type() == ebooklib.ITEM_DOCUMENT
+                and not isinstance(i, epub.EpubNav)]
 
         with tqdm(docs, unit="xhtml", dynamic_ncols=True) as bar:
             for item in bar:
@@ -117,8 +151,18 @@ class EpubProcessor:
                 if verbose:
                     bar.set_description(name)
                 try:
-                    new_content = process_xhtml(item.get_content(), translator)
+                    # 直接從 ZIP 讀取原始 bytes，繞過 ebooklib 的解析層
+                    zip_path = self._epub_root + item.get_name()
+                    try:
+                        raw = self._zipfile.read(zip_path)
+                    except KeyError:
+                        raw = item.get_content()
+                    new_content = process_xhtml(raw, translator)
                     item.set_content(new_content)
+                    # ebooklib 的 EpubHtml.get_content() 會把 self.content
+                    # 重新丟進 lxml 模板序列化，覆蓋我們修好的 head。
+                    # 直接 monkey-patch 這個 instance，讓 writer 拿到原始 bytes。
+                    item.get_content = lambda _bytes=new_content, default=None: _bytes
                 except Exception as e:
                     tqdm.write(f"  ⚠️  跳過 {name}: {e}")
 
