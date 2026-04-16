@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# 翻譯快取（可能含版權內容）
+.translate_cache.json
+
+# 輸出與原始書檔
+output/
+*.epub
+
+# 環境變數
+.env
+
+# macOS
+.DS_Store

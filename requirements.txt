@@ -1,0 +1,15 @@
+# EPUB 解析與寫入
+ebooklib==0.18
+
+# HTML 解析
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# 官方 Google API 呼叫
+requests>=2.31.0
+
+# .env 設定檔支援
+python-dotenv>=1.0.0
+
+# 進度條
+tqdm>=4.66.0
