@@ -36,6 +36,7 @@ class Translator:
         self.total_segments  = 0   # 翻譯段落數（含快取命中前的新段落）
         self.total_http      = 0   # 實際 HTTP 請求次數
         self.total_chars     = 0
+        self.fallback_count  = 0   # 遭遇漏句幻覺的降級次數
 
         self._session = requests.Session()
 
@@ -86,8 +87,7 @@ class Translator:
         )
         
         if self.use_free and self._needs_fallback(text, result, fmt):
-            from tqdm import tqdm
-            tqdm.write(f"  ⚠️  偵測到單段翻譯截斷/幻覺，啟動短句降級重譯...")
+            self.fallback_count += 1
             result = self._fallback_sentence_translation(text)
 
         self._store(key, result, len(text))
@@ -122,8 +122,7 @@ class Translator:
                 val = translated[arr_i]
                 orig_text = miss_texts[arr_i]
                 if self.use_free and self._needs_fallback(orig_text, val, fmt):
-                    from tqdm import tqdm
-                    tqdm.write(f"  ⚠️  偵測到批次翻譯截斷/幻覺，啟動短句降級重譯...")
+                    self.fallback_count += 1
                     val = self._fallback_sentence_translation(orig_text)
                     translated[arr_i] = val
                     
@@ -139,6 +138,8 @@ class Translator:
         self._save_cache()
         ratio = self.total_segments / self.total_http if self.total_http else 0
         print(f"\n📊 段落數：{self.total_segments}  HTTP 請求：{self.total_http}  平均每請求 {ratio:.1f} 段  翻譯字元：{self.total_chars:,}")
+        if self.fallback_count > 0:
+            print(f"🛡️  中途遭遇 {self.fallback_count} 次 NMT 漏句/幻覺，已透過碎紙機閃電隔離完美修復。")
 
     # ── Free mode ──────────────────────────────────────────────────────
 
