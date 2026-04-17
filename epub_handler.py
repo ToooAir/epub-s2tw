@@ -67,6 +67,8 @@ def _plausible(s_ng: str, t_ng: str, s2t: dict, is_all_fixed: bool = False) -> b
                 diffs += 1
                 if diffs > 1:
                     return False
+        if len(s_ng) < 4 and diffs > 0:
+            return False
         return True
 
     for sc, tc in zip(s_ng, t_ng):
@@ -410,8 +412,10 @@ class EpubProcessor:
         def _is_valid_replacement(s_ng: str, wrong: str, right: str, s2t: dict, is_all_fixed: bool) -> bool:
             """驗證把 wrong 換成 right 在語意上是合法的繁體字形修正。"""
             if is_all_fixed:
-                # 全固定字情況下，只允許至多一個字的差異
+                # 全固定字情況下，只允許至多一個字的差異，且前提是長度 >= 4
                 diffs = sum(1 for wc, rc in zip(wrong, right) if wc != rc)
+                if len(s_ng) < 4 and diffs > 0:
+                    return False
                 return diffs <= 1
 
             for sc, wc, rc in zip(s_ng, wrong, right):
