@@ -9,6 +9,7 @@ translate_epub.py — 將簡體中文 EPUB 翻譯為繁體中文
   python translate_epub.py ./*.epub --api-key YOUR_KEY
   python translate_epub.py ./*.epub --free --no-rename
   python translate_epub.py ./*.epub --dry-run
+  python translate_epub.py --clear-cache
 
 注意事項：
   - 預設輸出至 ./output，並用 opencc 將檔名轉為繁體中文
@@ -112,7 +113,20 @@ def main():
                         help="輸出一致性修正報告 (consistency_report.txt)")
     parser.add_argument("--dry-run", action="store_true",
                         help="只列出會處理的檔案，不實際翻譯")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="清除已儲存的翻譯快取 (.translate_cache.json)")
     args = parser.parse_args()
+
+    if args.clear_cache:
+        cache_file = Path(".translate_cache.json")
+        if cache_file.exists():
+            cache_file.unlink()
+            print("✅ 已經成功刪除 .translate_cache.json 翻譯快取！\n")
+        else:
+            print("💡 找不到快取檔案，無需刪除。\n")
+        
+        if not args.files and not args.dir:
+            sys.exit(0)
 
     output_dir = Path(args.output_dir).resolve()
 

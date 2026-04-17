@@ -81,6 +81,7 @@ python translate_epub.py -d ./books
 | `--log-consistency` | 輸出一致性修正報告 (`_consistency.txt`) |
 | `-v` | 顯示每個 XHTML 的處理進度 |
 | `--dry-run` | 只列出會處理的檔案，不實際翻譯 |
+| `--clear-cache` | 清除全域快取 `.translate_cache.json` |
 
 ### 完整範例
 
