@@ -11,6 +11,7 @@ Google Translate wrapper — 支援兩種模式：
 import json
 import hashlib
 import time
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -83,6 +84,12 @@ class Translator:
             if self.use_free
             else self._api_call([text], fmt)[0]
         )
+        
+        if self.use_free and self._needs_fallback(text, result, fmt):
+            from tqdm import tqdm
+            tqdm.write(f"  ⚠️  偵測到單段翻譯截斷/幻覺，啟動短句降級重譯...")
+            result = self._fallback_sentence_translation(text)
+
         self._store(key, result, len(text))
         return result
 
@@ -113,8 +120,15 @@ class Translator:
             )
             for arr_i, orig_i in enumerate(miss_idx):
                 val = translated[arr_i]
+                orig_text = miss_texts[arr_i]
+                if self.use_free and self._needs_fallback(orig_text, val, fmt):
+                    from tqdm import tqdm
+                    tqdm.write(f"  ⚠️  偵測到批次翻譯截斷/幻覺，啟動短句降級重譯...")
+                    val = self._fallback_sentence_translation(orig_text)
+                    translated[arr_i] = val
+                    
                 results[orig_i] = val
-                self._store(self._key(miss_texts[arr_i], fmt), val, len(miss_texts[arr_i]))
+                self._store(self._key(orig_text, fmt), val, len(orig_text))
 
         if self.total_segments % 40 == 0:
             self._save_cache()
@@ -131,6 +145,50 @@ class Translator:
     FREE_CHUNK   = 1800  # 單次請求安全字元上限
     SEP          = "\n⚡\n"  # 批次合併用分隔符（翻譯後應原樣保留）
     FREE_WORKERS = 5     # 並行請求數
+
+    def _needs_fallback(self, source: str, translated: str, fmt: str) -> bool:
+        if not source or not str(source).strip():
+            return False
+        if not translated or not str(translated).strip():
+            return True
+
+        src_text, tgt_text = str(source), str(translated)
+        if fmt == "html":
+            src_text = re.sub(r'<[^>]*>', '', src_text)
+            tgt_text = re.sub(r'<[^>]*>', '', tgt_text)
+
+        s_len, t_len = len(src_text.strip()), len(tgt_text.strip())
+        
+        # 1. Length Integrity Check (> 15% + 5 chars missing)
+        if s_len - t_len > max(5, s_len * 0.15):
+            return True
+
+        # 2. Punctuation Parity Check
+        s_end, t_end = src_text.rstrip(), tgt_text.rstrip()
+        if not s_end or not t_end:
+            return False
+            
+        quotes = ("」", "』", '"', "'", "”", "’")
+        if s_end.endswith(quotes) and not t_end.endswith(quotes):
+            return True
+
+        ends = ("。", "！", "？", "…", ".", "!", "?")
+        if s_end.endswith(ends) and not t_end.endswith(ends) and not t_end.endswith(quotes):
+            return True
+
+        return False
+
+    def _fallback_sentence_translation(self, text: str) -> str:
+        """用標點符號將原文切成極小單位（句子）逐一重譯，繞過 NMT 重複崩潰"""
+        parts = re.split(r'([。！？…\!\?\n]+)', text)
+        result = []
+        for p in parts:
+            if not p.strip() or re.match(r'^[。！？…\!\?\n]+$', p):
+                result.append(p)
+            else:
+                ans = self._free_request(p)
+                result.append(ans)
+        return "".join(result)
 
     def _free_single(self, text: str) -> str:
         """翻譯單段文字；超過上限自動切塊。"""
