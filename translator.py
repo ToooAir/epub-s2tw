@@ -179,16 +179,36 @@ class Translator:
         return False
 
     def _fallback_sentence_translation(self, text: str) -> str:
-        """用標點符號將原文切成極小單位（句子）逐一重譯，繞過 NMT 重複崩潰"""
+        """
+        將長文切成短句後，以 ⚡ 分隔連成「單一請求」送出。
+        這能強制切斷 Google NMT 翻譯高重複疊詞時會陷入的無限迴圈（Attention Hallucination），
+        同時避免「機關槍掃射」發送數十個 HTTP Requests 導致 500 Error。
+        """
         parts = re.split(r'([。！？…\!\?\n]+)', text)
-        result = []
+        
+        # 將標點與句子貼合
+        sentences = []
+        current = ""
         for p in parts:
             if not p.strip() or re.match(r'^[。！？…\!\?\n]+$', p):
-                result.append(p)
+                current += p
             else:
-                ans = self._free_request(p)
-                result.append(ans)
-        return "".join(result)
+                if current:
+                    sentences.append(current)
+                current = p
+        if current:
+            sentences.append(current)
+            
+        if not sentences:
+            return ""
+
+        # 以 ⚡ 連接並發送一發單一請求
+        batched_req = self.SEP.join(sentences)
+        translated_batched = self._free_request(batched_req)
+        
+        # 移掉分隔符號重新拼合為完整段落 (保險清除任何可能殘留的閃電符號)
+        clean_text = translated_batched.replace(self.SEP, "").replace("⚡", "")
+        return clean_text
 
     def _free_single(self, text: str) -> str:
         """翻譯單段文字；超過上限自動切塊。"""
