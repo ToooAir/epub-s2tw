@@ -18,9 +18,10 @@ class PostProcessor:
         corrections_path: str = "corrections.json",
         stphrases_path: str = "STPhrases.txt",
         stcharacters_path: str = "STCharacters.txt",
+        twvariants_path: str = "TWVariants.txt",
     ):
         self._s2t, self._corrections = self._build_corrections(
-            corrections_path, stphrases_path, stcharacters_path
+            corrections_path, stphrases_path, stcharacters_path, twvariants_path
         )
         # 按首字分組，長詞優先：加速 single-pass 掃描
         self._by_first: dict[str, list] = {}
@@ -30,7 +31,7 @@ class PostProcessor:
     # ── 建立 ────────────────────────────────────────────────────────────
 
     def _build_corrections(
-        self, corrections_path: str, stphrases_path: str, stcharacters_path: str
+        self, corrections_path: str, stphrases_path: str, stcharacters_path: str, twvariants_path: str
     ) -> tuple[dict[str, set], dict]:
         # STCharacters：建立 primary ↔ alt 對應，同時建立 s2t_map（簡→繁合法集合）
         primary_to_alts: dict[str, list] = {}
@@ -83,7 +84,30 @@ class PostProcessor:
             tested = {k: v for k, v in raw.items() if len(k) >= 2}
 
         # tested 優先覆蓋 generated
-        return s2t, {**generated, **tested}
+        final_corrections = {**generated, **tested}
+        
+        # 載入 TWVariants (異體字標準化)，覆蓋所有先前的設定，同時用來「清洗」字典裡的 value
+        v_p = Path(twvariants_path)
+        if v_p.exists():
+            tw_map = {}
+            with open(v_p, encoding="utf-8") as f:
+                for line in f:
+                    if "\t" not in line or line.startswith("#"):
+                        continue
+                    k, v = line.rstrip("\n").split("\t", 1)
+                    v = v.split()[0]
+                    if k and v and k != v:
+                        tw_map[k] = v
+                        final_corrections[k] = v
+            
+            # 使用 tw_map 清洗所有已有規則的 Value (把裡面的 纔會 變成 才會)
+            for k in list(final_corrections.keys()):
+                val = final_corrections[k]
+                new_val = "".join(tw_map.get(ch, ch) for ch in val)
+                if new_val != val:
+                    final_corrections[k] = new_val
+
+        return s2t, final_corrections
 
     @property
     def s2t_map(self) -> dict[str, set]:
