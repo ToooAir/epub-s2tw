@@ -67,7 +67,8 @@ def _plausible(s_ng: str, t_ng: str, s2t: dict, is_all_fixed: bool = False) -> b
                 diffs += 1
                 if diffs > 1:
                     return False
-        if len(s_ng) < 4 and diffs > 0:
+        # 放寬到長度 3（允許高頻專有名詞進入候選名單），嚴格過濾交由 _is_valid_replacement
+        if len(s_ng) < 3 and diffs > 0:
             return False
         return True
 
@@ -332,7 +333,7 @@ class EpubProcessor:
         s2t_map: dict | None = None,
         min_total: int = 10,
         min_minority: int = 2,
-        max_minor_ratio: float = 0.25,
+        max_minor_ratio: float = 0.33,
         report_path: str | None = None,
     ):
         """整本書翻譯完後，統一同一原文被翻成不同繁體寫法的情況。
@@ -349,6 +350,8 @@ class EpubProcessor:
         # 動態計算 min_total：段落越少門檻越低，避免樣本不足時無法觸發
         pair_count = len(self._text_pairs)
         min_total = max(4, pair_count // 200)
+        # 專有名詞高頻豁免門檻：某個詞出現次數大於此值，將豁免嚴格的全固定詞安全鎖
+        entity_thresh = max(15, pair_count // 50)
 
         cjk = re.compile(r'^[\u4e00-\u9fff\u3400-\u4dbf]+$')
         s2t = s2t_map or {}
@@ -398,10 +401,20 @@ class EpubProcessor:
                             candidates |= tgt_idx.get((n, tc0), _EMPTY)
                     for t_ng in candidates:
                         if (s_ng, t_ng) not in local_pairs and _plausible(s_ng, t_ng, s2t, is_all_fixed):
-                            # 反向碰撞檢查：如果容許了 1 個字的差異，我們必須確認 t_ng 是不是原文其他字串的翻譯
+                            # 反向碰撞檢查 (Competitive Alignment)：
+                            # 若 t_ng (如 艾莉亞) 與本段落中另一個原文 s_alt (如 艾莉娅) 的字元差異數，
+                            # 小於或等於它與 s_ng (如 艾莉莎) 的差異數，表示該翻譯有歧義，放棄歸屬！
                             if is_all_fixed and s_ng != t_ng:
-                                back_s = "".join(t2s.get(c, c) for c in t_ng)
-                                if back_s != s_ng and back_s in src:
+                                my_diff = sum(1 for a, b in zip(s_ng, t_ng) if a != b)
+                                ambiguous = False
+                                for i in range(len(src) - n + 1):
+                                    s_alt = src[i:i+n]
+                                    if s_alt != s_ng:
+                                        alt_diff = sum(1 for a, b in zip(s_alt, t_ng) if a != b)
+                                        if alt_diff <= my_diff:
+                                            ambiguous = True
+                                            break
+                                if ambiguous:
                                     continue
                             local_pairs.add((s_ng, t_ng))
 
@@ -409,12 +422,15 @@ class EpubProcessor:
                 src_to_tgt[s_ng][t_ng] += 1
 
         # ── 2. 找出翻譯不一致的原文 n-gram ───────────────────────────
-        def _is_valid_replacement(s_ng: str, wrong: str, right: str, s2t: dict, is_all_fixed: bool) -> bool:
+        def _is_valid_replacement(s_ng: str, wrong: str, right: str, s2t: dict, is_all_fixed: bool, total_count: int, entity_thresh: int) -> bool:
             """驗證把 wrong 換成 right 在語意上是合法的繁體字形修正。"""
             if is_all_fixed:
-                # 全固定字情況下，只允許至多一個字的差異，且前提是長度 >= 4
+                # 全固定字情況下，只允許至多一個字的差異
                 diffs = sum(1 for wc, rc in zip(wrong, right) if wc != rc)
                 if len(s_ng) < 4 and diffs > 0:
+                    # 豁免條款：長度為 3 的高頻全固定詞，若出現頻率極高，視為重要核心名詞
+                    if len(s_ng) == 3 and total_count >= entity_thresh:
+                        return diffs <= 1
                     return False
                 return diffs <= 1
 
@@ -447,7 +463,7 @@ class EpubProcessor:
                 if t_ng == majority_tgt:
                     continue
                 if count >= min_minority and count / total < max_minor_ratio:
-                    if not _is_valid_replacement(s_ng, t_ng, majority_tgt, s2t, is_all_fixed):
+                    if not _is_valid_replacement(s_ng, t_ng, majority_tgt, s2t, is_all_fixed, total, entity_thresh):
                         continue
                     # Fix 3：wrong 和 right 都是原文 n-gram 的合法 s2t 繁體 →
                     # 這是歧義字（如 发→發/髮），語意取決於上下文，交給 postprocessor 負責
@@ -477,6 +493,14 @@ class EpubProcessor:
             core_wrong = wrong[:last_diff + 1]
             core_right = right[:last_diff + 1]
             
+            # 【高危單字元或雙字元全固定字防呆機制】
+            is_core_all_fixed = all(sc not in s2t_keys for sc in wrong_to_source[wrong][:last_diff + 1])
+            if is_core_all_fixed and len(core_wrong) < 4:
+                # 核心長度不足 4 的全固定字，擴散替換風險過高（例如 雪底 → 雪之）
+                # 退回使用穩定的完整 n-gram 規則，不作精簡！
+                core_wrong = wrong
+                core_right = right
+
             if core_wrong in conflict_cores:
                 continue
             
@@ -495,9 +519,9 @@ class EpubProcessor:
         if not normalization:
             return
 
-        # ── 2c. 子片段過濾：移除被更長規則完整涵蓋的短規則 ──────────
-        # 若 wrong_a 是 wrong_b 的子字串，且對應位置的替換結果相同，
-        # 則 wrong_a 規則多餘且危險（會在其他上下文誤觸發）。
+        # ── 2c. 冗餘片段過濾：移除被較短規則完全涵蓋的冗餘長規則 ──────────
+        # 若 wa (短) 是 wb (長) 的子字串，且對應位置的替換結果也同步，
+        # 則 wb 是多餘的（wa 已經能完美涵蓋 wb 的替換行為），保留 wa 並刪除 wb。
         keys = list(normalization.keys())
         subfrags: set[str] = set()
         for wa in keys:
@@ -513,9 +537,24 @@ class EpubProcessor:
                     if p == -1:
                         break
                     if rb[p:p + len(ra)] == ra:
-                        subfrags.add(wa)
+                        subfrags.add(wb)  # 刪除長的（冗餘），保留短的（通用）
                         break
                     p += 1
+                    
+        # ── 2d. 矛盾對立過濾：解決互逆的翻譯循環 ──────────
+        # 若 shorter_rule 的正確翻譯(ra) 剛好是 longer_rule 企圖消滅的錯字(wb)
+        # 代表 longer_rule 在局部出現了相反的多數決，這會造成取代循環或反向破壞。
+        # 由於 shorter_rule 擁有更廣的泛用性與絕對多數支撐，必定以短規則為準，刪除長規則。
+        for wa in keys:
+            ra = normalization[wa]
+            for wb in keys:
+                if wa == wb or wb in subfrags:
+                    continue
+                rb = normalization[wb]
+                if ra in wb or wa in rb:
+                    if len(wa) < len(wb):
+                        subfrags.add(wb)  # 刪除長的（局部謬誤），保留短的（全域共識）
+                        
         for k in subfrags:
             del normalization[k]
 
