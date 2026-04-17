@@ -15,3 +15,6 @@ output/
 
 # macOS
 .DS_Store
+
+# Memory
+memory/

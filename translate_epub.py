@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from epub_handler import EpubProcessor
+from postprocess import PostProcessor
 from translator import Translator
 
 load_dotenv()
@@ -57,8 +58,10 @@ def process_file(
     input_path: Path,
     output_dir: Path,
     translator: Translator,
+    postprocessor: PostProcessor,
     rename: bool = True,
     verbose: bool = False,
+    log_consistency: bool = False,
 ) -> bool:
     stem     = input_path.stem.replace("_zhTW", "").strip()
     new_stem = to_trad_filename(stem) if rename else stem
@@ -71,7 +74,8 @@ def process_file(
     print(f"\n📖 {input_path.name}")
     try:
         proc = EpubProcessor(str(input_path))
-        proc.translate(translator, verbose=verbose)
+        report_path = output_dir / f"{new_stem}_consistency.txt" if log_consistency else None
+        proc.translate(translator, postprocessor=postprocessor, verbose=verbose, report_path=str(report_path) if report_path else None)
         proc.save(str(out_path))
         print(f"  ✅ → {out_path.name}")
         return True
@@ -104,6 +108,8 @@ def main():
                         help="不將輸出檔名轉為繁體")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="顯示每個 XHTML 檔案的進度")
+    parser.add_argument("--log-consistency", action="store_true",
+                        help="輸出一致性修正報告 (consistency_report.txt)")
     parser.add_argument("--dry-run", action="store_true",
                         help="只列出會處理的檔案，不實際翻譯")
     args = parser.parse_args()
@@ -154,13 +160,16 @@ def main():
         source  = "zh-CN",
         target  = "zh-TW",
     )
+    postprocessor = PostProcessor()
+    print(f"✓ 後處理器載入：{postprocessor.stats()}")
 
     success = fail = 0
     with tqdm(epub_files, unit="本", dynamic_ncols=True) as book_bar:
         for f in book_bar:
             book_bar.set_description(f.stem[:30])
-            ok = process_file(f, output_dir, translator,
-                              rename=not args.no_rename, verbose=args.verbose)
+            ok = process_file(f, output_dir, translator, postprocessor,
+                              rename=not args.no_rename, verbose=args.verbose,
+                              log_consistency=args.log_consistency)
             if ok:
                 success += 1
             else:

@@ -15,11 +15,14 @@ EPUB 讀取、文字抽取、翻譯替換、儲存。
 
 import re
 import zipfile
+from collections import Counter, defaultdict
 
 from bs4 import BeautifulSoup
 import ebooklib
 from ebooklib import epub
 from tqdm import tqdm
+
+_EMPTY: frozenset = frozenset()  # 空集合常數，避免 defaultdict 每次建新物件
 
 # 要翻譯的 block-level tag
 BLOCK_TAGS = {
@@ -52,9 +55,62 @@ def _replace_inner_html(tag, new_html: str):
             tag.append(child)
 
 
+# ── 段落搜尋法：source n-gram 在 target 段落中找合法翻譯形式 ──────────
+
+def _plausible(s_ng: str, t_ng: str, s2t: dict, is_all_fixed: bool = False) -> bool:
+    """判斷 t_ng 是否為 s_ng 的位置對齊合法翻譯。
+    """
+    if is_all_fixed:
+        diffs = 0
+        for sc, tc in zip(s_ng, t_ng):
+            if sc != tc:
+                diffs += 1
+                if diffs > 1:
+                    return False
+        return True
+
+    for sc, tc in zip(s_ng, t_ng):
+        if sc == tc:
+            continue
+        if sc not in s2t:
+            # 固定字：必須完全相同
+            return False
+        else:
+            # 轉換字：必須是該字的已知合法繁體
+            if tc not in s2t[sc]:
+                return False
+    return True
+
+
+def _aligned_regions(src: str, tgt: str, s2t: dict, t2s: dict) -> list[tuple[int, int]]:
+    """回傳 (start, end) 區間，代表 src/tgt 位置對齊合法的連續段落。
+
+    合法條件（三者之一）：
+      - src[i] == tgt[i]：字元相同，無需轉換
+      - tgt[i] 是 src[i] 的已知繁體形式（s2t）
+      - tgt[i] 不是任何簡體字的已知繁體形式（t2s reverse map 查不到）→ 音譯/轉寫字，允許通過
+
+    斷點：tgt[i] 屬於「其他」簡體字的繁體（Google 在此換詞）。
+    """
+    regions: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, (sc, tc) in enumerate(zip(src, tgt)):
+        valid = sc == tc or tc in s2t.get(sc, ()) or tc not in t2s
+        if valid:
+            if start is None:
+                start = i
+        else:
+            if start is not None:
+                regions.append((start, i))
+                start = None
+    if start is not None:
+        regions.append((start, len(src)))
+    return regions
+
+
 # ── 主要處理函式 ───────────────────────────────────────────────────────
 
-def process_xhtml(content: bytes, translator) -> bytes:
+def process_xhtml(content: bytes, translator, postprocessor=None, pairs_collector: list | None = None) -> bytes:
     """翻譯一個 XHTML 文件的內容並回傳修改後的 bytes。"""
     try:
         decoded = content.decode("utf-8")
@@ -92,19 +148,30 @@ def process_xhtml(content: bytes, translator) -> bytes:
     if not plain_segs and not html_segs and not title_text:
         return content
 
+    pp = postprocessor
+
     # 純文字批次翻譯
     if plain_segs:
         texts      = [t for _, t in plain_segs]
         translated = translator.translate_batch(texts, fmt="text")
-        for (tag, _), new_text in zip(plain_segs, translated):
-            tag.string = new_text
+        for (tag, orig), new_text in zip(plain_segs, translated):
+            final = pp.apply(new_text) if pp else new_text
+            tag.string = final
+            if pairs_collector is not None:
+                pairs_collector.append((orig, final))
 
     # HTML 格式翻譯（含 inline 標籤）
     if html_segs:
         html_texts      = [h for _, h in html_segs]
         translated_html = translator.translate_batch(html_texts, fmt="html")
-        for (tag, _), new_html in zip(html_segs, translated_html):
-            _replace_inner_html(tag, new_html)
+        for (tag, orig_html), new_html in zip(html_segs, translated_html):
+            final_html = pp.apply(new_html) if pp else new_html
+            _replace_inner_html(tag, final_html)
+            if pairs_collector is not None:
+                orig_text = BeautifulSoup(orig_html, "html.parser").get_text()
+                tgt_text  = BeautifulSoup(final_html, "html.parser").get_text()
+                if orig_text.strip():
+                    pairs_collector.append((orig_text, tgt_text))
 
     result = str(soup)
     # lxml-xml 會把 SVG 的 viewBox 小寫化，需還原（SVG 屬性大小寫敏感）
@@ -119,6 +186,8 @@ def process_xhtml(content: bytes, translator) -> bytes:
     # HEAD_PAT 還原了原始 head（含未翻譯 title），此處將 title 替換為翻譯版本
     if title_text:
         translated_title = translator.translate(title_text)
+        if pp:
+            translated_title = pp.apply(translated_title)
         TITLE_PAT = re.compile(r'(<title[^>]*>)\s*.*?\s*(</title>)', re.DOTALL | re.IGNORECASE)
         result = TITLE_PAT.sub(rf'\g<1>{translated_title}\g<2>', result, count=1)
 
@@ -132,6 +201,7 @@ class EpubProcessor:
     def __init__(self, path: str):
         self.path = path
         self.book = epub.read_epub(path, {"ignore_ncx": False})
+        self._text_pairs: list[tuple[str, str]] = []  # (原文, 翻譯) 純文字對
         # 保留原始 ZIP，讓 process_xhtml 能拿到未經 ebooklib 解析的 raw bytes
         self._zipfile = zipfile.ZipFile(path, "r")
         # 推算 EPUB content 根目錄（OPF 所在資料夾，通常是 OEBPS/ 或 EPUB/）
@@ -139,7 +209,7 @@ class EpubProcessor:
         opf_dir = opf_candidates[0].rsplit("/", 1)[0] + "/" if opf_candidates else ""
         self._epub_root = opf_dir  # e.g. "OEBPS/"
 
-    def translate(self, translator, verbose: bool = False):
+    def translate(self, translator, postprocessor=None, verbose: bool = False, report_path: str | None = None):
         """翻譯整本 EPUB 的 HTML 文件與 metadata。"""
         docs = [i for i in self.book.get_items()
                 if i.get_type() == ebooklib.ITEM_DOCUMENT
@@ -151,26 +221,24 @@ class EpubProcessor:
                 if verbose:
                     bar.set_description(name)
                 try:
-                    # 直接從 ZIP 讀取原始 bytes，繞過 ebooklib 的解析層
                     zip_path = self._epub_root + item.get_name()
                     try:
                         raw = self._zipfile.read(zip_path)
                     except KeyError:
                         raw = item.get_content()
-                    new_content = process_xhtml(raw, translator)
+                    new_content = process_xhtml(raw, translator, postprocessor, self._text_pairs)
                     item.set_content(new_content)
-                    # ebooklib 的 EpubHtml.get_content() 會把 self.content
-                    # 重新丟進 lxml 模板序列化，覆蓋我們修好的 head。
-                    # 直接 monkey-patch 這個 instance，讓 writer 拿到原始 bytes。
                     item.get_content = lambda _bytes=new_content, default=None: _bytes
                 except Exception as e:
                     tqdm.write(f"  ⚠️  跳過 {name}: {e}")
 
-        self._translate_ncx(translator)
-        self._translate_toc(translator)
-        self._translate_metadata(translator)
+        self._translate_ncx(translator, postprocessor)
+        self._translate_toc(translator, postprocessor)
+        self._translate_metadata(translator, postprocessor)
+        s2t = postprocessor.s2t_map if postprocessor else {}
+        self._consistency_pass(docs, s2t_map=s2t, report_path=report_path)
 
-    def _translate_ncx(self, translator):
+    def _translate_ncx(self, translator, postprocessor=None):
         """翻譯 toc.ncx 中的 <navLabel><text> 與 <docTitle><text>。"""
         for item in self.book.get_items():
             if not item.get_name().lower().endswith(".ncx"):
@@ -184,25 +252,29 @@ class EpubProcessor:
                 originals  = [t.get_text() for t in text_tags]
                 translated = translator.translate_batch(originals)
                 for tag, new_text in zip(text_tags, translated):
-                    tag.string = new_text
+                    tag.string = postprocessor.apply(new_text) if postprocessor else new_text
                 item.set_content(str(soup).encode("utf-8"))
             except Exception as e:
                 tqdm.write(f"  ⚠️  跳過 NCX: {e}")
 
-    def _translate_toc(self, translator):
+    def _translate_toc(self, translator, postprocessor=None):
         """翻譯 book.toc（ebooklib 用來生成 nav.xhtml 的來源）。"""
         from ebooklib.epub import Link, Section
+        pp = postprocessor
+
+        def _t(text):
+            result = translator.translate(text)
+            return pp.apply(result) if pp else result
 
         def translate_entries(entries):
             for entry in entries:
                 if isinstance(entry, Link):
-                    entry.title = translator.translate(entry.title)
+                    entry.title = _t(entry.title)
                 elif isinstance(entry, Section):
-                    entry.title = translator.translate(entry.title)
+                    entry.title = _t(entry.title)
                     if entry.children:
                         translate_entries(entry.children)
                 elif isinstance(entry, tuple) and len(entry) == 2:
-                    # (Section, [children]) 形式
                     translate_entries([entry[0]])
                     translate_entries(entry[1])
 
@@ -211,7 +283,8 @@ class EpubProcessor:
         except Exception as e:
             tqdm.write(f"  ⚠️  翻譯 TOC 失敗: {e}")
 
-    def _translate_metadata(self, translator):
+    def _translate_metadata(self, translator, postprocessor=None):
+        pp = postprocessor
         DC = "http://purl.org/dc/elements/1.1/"
         for field in META_FIELDS:
             try:
@@ -219,7 +292,11 @@ class EpubProcessor:
                 if not items:
                     continue
                 self.book.metadata[DC][field] = [
-                    (translator.translate(value) if value else value, attrs)
+                    (
+                        (pp.apply(translator.translate(value)) if pp else translator.translate(value))
+                        if value else value,
+                        attrs,
+                    )
                     for value, attrs in items
                 ]
             except Exception as e:
@@ -237,11 +314,293 @@ class EpubProcessor:
         try:
             if None in self.book.metadata.get(OPF, {}):
                 self.book.metadata[OPF][None] = [
-                    (translator.translate(v) if attrs.get("property") in TRANSLATE_PROPS and v else v, attrs)
+                    (
+                        (pp.apply(translator.translate(v)) if pp else translator.translate(v))
+                        if attrs.get("property") in TRANSLATE_PROPS and v else v,
+                        attrs,
+                    )
                     for v, attrs in self.book.metadata[OPF][None]
                 ]
         except Exception as e:
             tqdm.write(f"  ⚠️  OPF meta: {e}")
+
+    def _consistency_pass(
+        self,
+        docs,
+        s2t_map: dict | None = None,
+        min_total: int = 10,
+        min_minority: int = 2,
+        max_minor_ratio: float = 0.25,
+        report_path: str | None = None,
+    ):
+        """整本書翻譯完後，統一同一原文被翻成不同繁體寫法的情況。
+
+        演算法：
+          1. 利用 _text_pairs（原文, 翻譯）的位置對齊，建立
+             { 原文n-gram → Counter(翻譯n-gram) }
+          2. 同一原文 n-gram 對應多個翻譯形式 → 少數派統一成多數派
+          3. 套用回每個 XHTML item
+        """
+        if not self._text_pairs:
+            return
+
+        # 動態計算 min_total：段落越少門檻越低，避免樣本不足時無法觸發
+        pair_count = len(self._text_pairs)
+        min_total = max(4, pair_count // 200)
+
+        cjk = re.compile(r'^[\u4e00-\u9fff\u3400-\u4dbf]+$')
+        s2t = s2t_map or {}
+        # t2s：繁體字 → 來源簡體字（用於偵測 Google 字形混淆，如 莉→麗 來自 丽→麗）
+        t2s: dict[str, str] = {
+            trad: simp
+            for simp, trads in s2t.items()
+            for trad in trads
+            if trad != simp
+        }
+
+        # ── 1. 建立原文 n-gram → 翻譯 n-gram 計數（段落搜尋法）─────────
+        # 不依賴字元位置對齊；改為在 target 段落中搜尋 source n-gram 的合法翻譯形式：
+        # - 固定字（不在 s2t_keys）：target 位置必須是同一字
+        # - 轉換字（在 s2t_keys，如 丽→麗/莉）：target 位置允許任何非簡體 CJK
+        # 每個 (src, tgt) 段落對，每個 (s_ng, t_ng) 配對只計一次。
+        s2t_keys = frozenset(s2t.keys())
+        src_to_tgt: dict[str, Counter] = defaultdict(Counter)
+
+        for src, tgt in self._text_pairs:
+            # 建立 target n-gram 索引：(長度, 首字) → set(t_ng)
+            # 用首字做第一層過濾，把候選從 O(全 n-gram) 降到 O(幾個)
+            tgt_idx: dict[tuple[int, str], set[str]] = defaultdict(set)
+            for n in range(3, 5):
+                for j in range(len(tgt) - n + 1):
+                    t_ng = tgt[j:j+n]
+                    if cjk.match(t_ng):
+                        tgt_idx[(n, t_ng[0])].add(t_ng)
+
+            # 每個 (s_ng, t_ng) 對在本段落只計一次
+            local_pairs: set[tuple[str, str]] = set()
+            for n in range(3, 5):
+                for i in range(len(src) - n + 1):
+                    s_ng = src[i:i+n]
+                    if not cjk.match(s_ng):
+                        continue
+                    sc0 = s_ng[0]
+                    is_all_fixed = all(sc not in s2t_keys for sc in s_ng)
+                    
+                    if sc0 not in s2t_keys:
+                        # 固定首字：target 以同字開頭
+                        candidates = tgt_idx.get((n, sc0), _EMPTY)
+                    else:
+                        # 轉換首字：target 以各 s2t 對應形式開頭
+                        candidates = set()
+                        for tc0 in s2t.get(sc0, ()):
+                            candidates |= tgt_idx.get((n, tc0), _EMPTY)
+                    for t_ng in candidates:
+                        if (s_ng, t_ng) not in local_pairs and _plausible(s_ng, t_ng, s2t, is_all_fixed):
+                            # 反向碰撞檢查：如果容許了 1 個字的差異，我們必須確認 t_ng 是不是原文其他字串的翻譯
+                            if is_all_fixed and s_ng != t_ng:
+                                back_s = "".join(t2s.get(c, c) for c in t_ng)
+                                if back_s != s_ng and back_s in src:
+                                    continue
+                            local_pairs.add((s_ng, t_ng))
+
+            for s_ng, t_ng in local_pairs:
+                src_to_tgt[s_ng][t_ng] += 1
+
+        # ── 2. 找出翻譯不一致的原文 n-gram ───────────────────────────
+        def _is_valid_replacement(s_ng: str, wrong: str, right: str, s2t: dict, is_all_fixed: bool) -> bool:
+            """驗證把 wrong 換成 right 在語意上是合法的繁體字形修正。"""
+            if is_all_fixed:
+                # 全固定字情況下，只允許至多一個字的差異
+                diffs = sum(1 for wc, rc in zip(wrong, right) if wc != rc)
+                return diffs <= 1
+
+            for sc, wc, rc in zip(s_ng, wrong, right):
+                if wc == rc:
+                    continue
+                if rc not in s2t.get(sc, set()):
+                    return False
+            return True
+
+        normalization: dict[str, str] = {}  # {少數翻譯: 多數翻譯}
+        wrong_to_source: dict[str, str] = {}  # 用於 debug 追蹤 wrong 是從哪個原文配對來的
+
+        for s_ng, tgt_counts in src_to_tgt.items():
+            if len(tgt_counts) < 2:
+                continue
+            total = sum(tgt_counts.values())
+            if total < min_total:
+                continue
+                
+            is_all_fixed = all(sc not in s2t_keys for sc in s_ng)
+            majority_tgt, majority_count = tgt_counts.most_common(1)[0]
+            
+            # Fix 2：多數派與原文相同（未轉換）→ 若為非全固定字才跳過，避免把合法繁體改回簡體
+            if majority_tgt == s_ng:
+                if not is_all_fixed:
+                    continue
+                    
+            for t_ng, count in tgt_counts.items():
+                if t_ng == majority_tgt:
+                    continue
+                if count >= min_minority and count / total < max_minor_ratio:
+                    if not _is_valid_replacement(s_ng, t_ng, majority_tgt, s2t, is_all_fixed):
+                        continue
+                    # Fix 3：wrong 和 right 都是原文 n-gram 的合法 s2t 繁體 →
+                    # 這是歧義字（如 发→發/髮），語意取決於上下文，交給 postprocessor 負責
+                    if all(
+                        wc == rc
+                        or (wc in s2t.get(sc, ()) and rc in s2t.get(sc, ()))
+                        for sc, wc, rc in zip(s_ng, t_ng, majority_tgt)
+                    ):
+                        continue
+                    normalization[t_ng] = majority_tgt
+                    wrong_to_source[t_ng] = s_ng
+
+        if not normalization:
+            return
+
+        # ── 2b. 核心差異精簡：提煉最短差異前綴 ──────────
+        # 將長度較長但不影響差異字的後綴去除，提升修正覆蓋率（例如 艾麗莎不 → 艾麗）
+        optimized_norm: dict[str, str] = {}
+        optimized_source: dict[str, str] = {}
+        conflict_cores: set[str] = set()
+
+        for wrong, right in list(normalization.items()):
+            diff_indices = [i for i, (w, r) in enumerate(zip(wrong, right)) if w != r]
+            if not diff_indices:
+                continue
+            last_diff = max(diff_indices)
+            core_wrong = wrong[:last_diff + 1]
+            core_right = right[:last_diff + 1]
+            
+            if core_wrong in conflict_cores:
+                continue
+            
+            if core_wrong in optimized_norm:
+                if optimized_norm[core_wrong] != core_right:
+                    del optimized_norm[core_wrong]
+                    del optimized_source[core_wrong]
+                    conflict_cores.add(core_wrong)
+            else:
+                optimized_norm[core_wrong] = core_right
+                optimized_source[core_wrong] = wrong_to_source[wrong]
+
+        normalization = optimized_norm
+        wrong_to_source = optimized_source
+
+        if not normalization:
+            return
+
+        # ── 2c. 子片段過濾：移除被更長規則完整涵蓋的短規則 ──────────
+        # 若 wrong_a 是 wrong_b 的子字串，且對應位置的替換結果相同，
+        # 則 wrong_a 規則多餘且危險（會在其他上下文誤觸發）。
+        keys = list(normalization.keys())
+        subfrags: set[str] = set()
+        for wa in keys:
+            ra = normalization[wa]
+            for wb in keys:
+                if wa == wb or len(wb) <= len(wa):
+                    continue
+                rb = normalization[wb]
+                # 在 wb/rb 中搜尋 wa/ra 出現的同一位置
+                p = 0
+                while True:
+                    p = wb.find(wa, p)
+                    if p == -1:
+                        break
+                    if rb[p:p + len(ra)] == ra:
+                        subfrags.add(wa)
+                        break
+                    p += 1
+        for k in subfrags:
+            del normalization[k]
+
+        if not normalization:
+            return
+
+        tqdm.write(f"  📝 一致性修正：{len(normalization)} 組")
+        for wrong, right in list(normalization.items())[:5]:
+            tqdm.write(f"       {wrong} → {right}")
+
+        # ── 3. 套用回每個 item，同時收集 debug 資訊 ──────────────────
+        tag_re   = re.compile(r"<[^>]+>")
+        sorted_norm = sorted(normalization.items(), key=lambda x: -len(x[0]))
+
+        # wrong → [(before, after), ...]  每組最多保留 5 個例句
+        debug_hits: dict[str, list[tuple[str, str]]] = {w: [] for w, _ in sorted_norm}
+
+        for item in docs:
+            try:
+                content_bytes = item.get_content()
+                content = content_bytes.decode("utf-8", errors="ignore")
+                plain   = tag_re.sub("", content)
+                for wrong, right in sorted_norm:
+                    if wrong not in content:
+                        continue
+                    # 收集例句（在 plain text 中搜尋，最多 5 句）
+                    hits = debug_hits[wrong]
+                    if len(hits) < 5:
+                        idx = 0
+                        while len(hits) < 5:
+                            pos = plain.find(wrong, idx)
+                            if pos == -1:
+                                break
+                            ctx_s = max(0, pos - 35)
+                            ctx_e = min(len(plain), pos + len(wrong) + 35)
+                            before = plain[ctx_s:ctx_e].replace("\n", " ").strip()
+                            after  = before.replace(wrong, right, 1)
+                            hits.append((before, after))
+                            idx = pos + 1
+                            
+                # Fix C: 在 BeautifulSoup 的文字節點上進行替換，防止破壞 HTML 標籤屬性
+                try:
+                    soup = BeautifulSoup(content_bytes, "lxml-xml")
+                except Exception:
+                    soup = BeautifulSoup(content_bytes, "html.parser")
+
+                changed = False
+                for text_node in soup.find_all(string=True):
+                    if text_node.parent and text_node.parent.name in SKIP_ANCESTOR:
+                        continue
+                    new_text = str(text_node)
+                    original_text = new_text
+                    for wrong, right in sorted_norm:
+                        if wrong in new_text:
+                            new_text = new_text.replace(wrong, right)
+                    if new_text != original_text:
+                        text_node.replace_with(new_text)
+                        changed = True
+
+                if changed:
+                    result = str(soup)
+                    result = re.sub(r'\bviewbox\b', 'viewBox', result)
+                    HEAD_PAT = re.compile(r'<head(?:\s[^>]*)?(?:/>|>.*?</head>)', re.DOTALL | re.IGNORECASE)
+                    orig_head = HEAD_PAT.search(content)
+                    if orig_head:
+                        result = HEAD_PAT.sub(orig_head.group(0), result, count=1)
+                    patched = result.encode("utf-8")
+                    item.set_content(patched)
+                    item.get_content = lambda b=patched, d=None: b
+            except Exception:
+                continue
+
+        # ── 4. 寫出報告檔案 ─────────────────────────────────────────
+        if report_path:
+            import os
+            try:
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(f"=== 一致性修正報告 ({len(normalization)} 組) ===\n\n")
+                    for idx, (wrong, right) in enumerate(sorted_norm, 1):
+                        hits = debug_hits.get(wrong, [])
+                        source_str = wrong_to_source.get(wrong, "unknown")
+                        f.write(f"[{idx:02d}] {wrong} → {right}  (source: {source_str}, {len(hits)} 個例句)\n")
+                        for before, after in hits:
+                            f.write(f"  修正前：…{before}…\n")
+                            f.write(f"  修正後：…{after}…\n")
+                        f.write("\n")
+                tqdm.write(f"  📄 一致性報告已輸出：{os.path.basename(report_path)}")
+            except Exception as e:
+                tqdm.write(f"  ⚠️  報告寫入失敗：{e}")
 
     def save(self, output_path: str):
         epub.write_epub(output_path, self.book, {})
