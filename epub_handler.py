@@ -324,8 +324,6 @@ class EpubProcessor:
         # 動態計算 min_total：段落越少門檻越低，避免樣本不足時無法觸發
         pair_count = len(self._text_pairs)
         min_total = max(4, pair_count // 200)
-        # 專有名詞高頻豁免門檻：某個詞出現次數大於此值，將豁免嚴格的全固定詞安全鎖
-        entity_thresh = max(15, pair_count // 50)
 
         cjk = re.compile(r'^[\u4e00-\u9fff\u3400-\u4dbf]+$')
         s2t = s2t_map or {}
@@ -344,9 +342,9 @@ class EpubProcessor:
         # 每個 (src, tgt) 段落對，每個 (s_ng, t_ng) 配對只計一次。
         s2t_keys = frozenset(s2t.keys())
         src_to_tgt: dict[str, Counter] = defaultdict(Counter)
-        
+
         # 全書 VIP 門檻：至少 15 次，若書本極長則隨書本長度提升 (每 50 個段落提高 1 次出鏡要求)
-        entity_thresh = max(15, len(self._text_pairs) // 50)
+        entity_thresh = max(15, pair_count // 50)
 
         for src, tgt in self._text_pairs:
             # 建立 target n-gram 索引：(長度, 首字) → set(t_ng)
