@@ -444,6 +444,26 @@ class EpubProcessor:
         normalization: dict[str, str] = {}  # {少數翻譯: 多數翻譯}
         wrong_to_source: dict[str, str] = {}  # 用於 debug 追蹤 wrong 是從哪個原文配對來的
 
+        # ── Pass 1: 建立全域合法標靶 (Global Legitimate Targets) ──────────
+        # 避免把「雙胞胎兄弟的合法名字」當成偶然的錯字庫給全域抹除掉
+        global_legitimate_targets: set[str] = set()
+        s_ng_to_majority: dict[str, str] = {}
+        for s_ng, tgt_counts in src_to_tgt.items():
+            if sum(tgt_counts.values()) < min_total:
+                continue
+            is_all_fixed = all(sc not in s2t_keys for sc in s_ng)
+            if is_all_fixed and s_ng in tgt_counts:
+                # 絕對真理法則 (Absolute Truth Defense):
+                # 若原文全為固定字，其完美的繁體映射必為自身。
+                # 防止 Google 幻覺翻譯發生 51% 攻擊（如 15 次「政近一步」贏過 5 次「政近一行」），
+                # 我們強行剝奪 AI 的多數決權力，擁戴絕對真理！
+                majority_tgt = s_ng
+            else:
+                majority_tgt = tgt_counts.most_common(1)[0][0]
+            s_ng_to_majority[s_ng] = majority_tgt
+            global_legitimate_targets.add(majority_tgt)
+
+        # ── Pass 2: 建立一致性修正對應表 ──────────
         for s_ng, tgt_counts in src_to_tgt.items():
             if len(tgt_counts) < 2:
                 continue
@@ -452,24 +472,23 @@ class EpubProcessor:
                 continue
                 
             is_all_fixed = all(sc not in s2t_keys for sc in s_ng)
-            
-            if is_all_fixed and s_ng in tgt_counts:
-                # 絕對真理法則 (Absolute Truth Defense):
-                # 若原文全為固定字，其完美的繁體映射必為自身。
-                # 防止 Google 幻覺翻譯發生 51% 攻擊（如 15 次「政近一步」贏過 5 次「政近一行」），
-                # 我們強行剝奪 AI 的多數決權力，擁戴絕對真理！
-                majority_tgt = s_ng
-            else:
-                majority_tgt, majority_count = tgt_counts.most_common(1)[0]
+            majority_tgt = s_ng_to_majority[s_ng]
             
             # Fix 2：多數派與原文相同（未轉換）→ 若為非全固定字才跳過，避免把合法繁體改回簡體
             if majority_tgt == s_ng:
                 if not is_all_fixed:
                     continue
                     
+            entity_thresh = max(15, total // 50)
+            
             for t_ng, count in tgt_counts.items():
                 if t_ng == majority_tgt:
                     continue
+                    
+                # 【全域防撞機制】：若此候選本身就是本書其他合法名詞的正解（例如雙胞胎），絕不能抹除它！
+                if t_ng in global_legitimate_targets:
+                    continue
+                    
                 # 如果是真理模式，無視少數派比例強制清除 AI 幻覺；否則受限於容錯閾值
                 if not (is_all_fixed and majority_tgt == s_ng):
                     if count < min_minority or count / total >= max_minor_ratio:
