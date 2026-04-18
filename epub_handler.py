@@ -85,32 +85,6 @@ def _plausible(s_ng: str, t_ng: str, s2t: dict, is_all_fixed: bool = False) -> b
     return True
 
 
-def _aligned_regions(src: str, tgt: str, s2t: dict, t2s: dict) -> list[tuple[int, int]]:
-    """回傳 (start, end) 區間，代表 src/tgt 位置對齊合法的連續段落。
-
-    合法條件（三者之一）：
-      - src[i] == tgt[i]：字元相同，無需轉換
-      - tgt[i] 是 src[i] 的已知繁體形式（s2t）
-      - tgt[i] 不是任何簡體字的已知繁體形式（t2s reverse map 查不到）→ 音譯/轉寫字，允許通過
-
-    斷點：tgt[i] 屬於「其他」簡體字的繁體（Google 在此換詞）。
-    """
-    regions: list[tuple[int, int]] = []
-    start: int | None = None
-    for i, (sc, tc) in enumerate(zip(src, tgt)):
-        valid = sc == tc or tc in s2t.get(sc, ()) or tc not in t2s
-        if valid:
-            if start is None:
-                start = i
-        else:
-            if start is not None:
-                regions.append((start, i))
-                start = None
-    if start is not None:
-        regions.append((start, len(src)))
-    return regions
-
-
 # ── 主要處理函式 ───────────────────────────────────────────────────────
 
 def process_xhtml(content: bytes, translator, postprocessor=None, pairs_collector: list | None = None) -> bytes:
@@ -331,7 +305,7 @@ class EpubProcessor:
         self,
         docs,
         s2t_map: dict | None = None,
-        min_total: int = 10,
+        min_total: int = 4,
         min_minority: int = 2,
         max_minor_ratio: float = 0.33,
         report_path: str | None = None,
@@ -370,6 +344,9 @@ class EpubProcessor:
         # 每個 (src, tgt) 段落對，每個 (s_ng, t_ng) 配對只計一次。
         s2t_keys = frozenset(s2t.keys())
         src_to_tgt: dict[str, Counter] = defaultdict(Counter)
+        
+        # 全書 VIP 門檻：至少 15 次，若書本極長則隨書本長度提升 (每 50 個段落提高 1 次出鏡要求)
+        entity_thresh = max(15, len(self._text_pairs) // 50)
 
         for src, tgt in self._text_pairs:
             # 建立 target n-gram 索引：(長度, 首字) → set(t_ng)
@@ -407,8 +384,8 @@ class EpubProcessor:
                             if is_all_fixed and s_ng != t_ng:
                                 my_diff = sum(1 for a, b in zip(s_ng, t_ng) if a != b)
                                 ambiguous = False
-                                for i in range(len(src) - n + 1):
-                                    s_alt = src[i:i+n]
+                                for j in range(len(src) - n + 1):
+                                    s_alt = src[j:j+n]
                                     if s_alt != s_ng:
                                         alt_diff = sum(1 for a, b in zip(s_alt, t_ng) if a != b)
                                         if alt_diff <= my_diff:
@@ -478,9 +455,7 @@ class EpubProcessor:
             if majority_tgt == s_ng:
                 if not is_all_fixed:
                     continue
-                    
-            entity_thresh = max(15, total // 50)
-            
+
             for t_ng, count in tgt_counts.items():
                 if t_ng == majority_tgt:
                     continue
@@ -576,6 +551,8 @@ class EpubProcessor:
         # 代表 longer_rule 在局部出現了相反的多數決，這會造成取代循環或反向破壞。
         # 由於 shorter_rule 擁有更廣的泛用性與絕對多數支撐，必定以短規則為準，刪除長規則。
         for wa in keys:
+            if wa in subfrags:
+                continue
             ra = normalization[wa]
             for wb in keys:
                 if wa == wb or wb in subfrags:
@@ -601,6 +578,7 @@ class EpubProcessor:
 
         # wrong → [(before, after), ...]  每組最多保留 5 個例句
         debug_hits: dict[str, list[tuple[str, str]]] = {w: [] for w, _ in sorted_norm}
+        HEAD_PAT = re.compile(r'<head(?:\s[^>]*)?(?:/>|>.*?</head>)', re.DOTALL | re.IGNORECASE)
 
         for item in docs:
             try:
@@ -647,7 +625,6 @@ class EpubProcessor:
                 if changed:
                     result = str(soup)
                     result = re.sub(r'\bviewbox\b', 'viewBox', result)
-                    HEAD_PAT = re.compile(r'<head(?:\s[^>]*)?(?:/>|>.*?</head>)', re.DOTALL | re.IGNORECASE)
                     orig_head = HEAD_PAT.search(content)
                     if orig_head:
                         result = HEAD_PAT.sub(orig_head.group(0), result, count=1)
