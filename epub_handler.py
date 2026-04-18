@@ -452,7 +452,15 @@ class EpubProcessor:
                 continue
                 
             is_all_fixed = all(sc not in s2t_keys for sc in s_ng)
-            majority_tgt, majority_count = tgt_counts.most_common(1)[0]
+            
+            if is_all_fixed and s_ng in tgt_counts:
+                # 絕對真理法則 (Absolute Truth Defense):
+                # 若原文全為固定字，其完美的繁體映射必為自身。
+                # 防止 Google 幻覺翻譯發生 51% 攻擊（如 15 次「政近一步」贏過 5 次「政近一行」），
+                # 我們強行剝奪 AI 的多數決權力，擁戴絕對真理！
+                majority_tgt = s_ng
+            else:
+                majority_tgt, majority_count = tgt_counts.most_common(1)[0]
             
             # Fix 2：多數派與原文相同（未轉換）→ 若為非全固定字才跳過，避免把合法繁體改回簡體
             if majority_tgt == s_ng:
@@ -462,7 +470,10 @@ class EpubProcessor:
             for t_ng, count in tgt_counts.items():
                 if t_ng == majority_tgt:
                     continue
-                if count >= min_minority and count / total < max_minor_ratio:
+                # 如果是真理模式，無視少數派比例強制清除 AI 幻覺；否則受限於容錯閾值
+                if not (is_all_fixed and majority_tgt == s_ng):
+                    if count < min_minority or count / total >= max_minor_ratio:
+                        continue
                     if not _is_valid_replacement(s_ng, t_ng, majority_tgt, s2t, is_all_fixed, total, entity_thresh):
                         continue
                     # Fix 3：wrong 和 right 都是原文 n-gram 的合法 s2t 繁體 →
