@@ -192,8 +192,16 @@ class EpubProcessor:
                 if i.get_type() == ebooklib.ITEM_DOCUMENT
                 and not isinstance(i, epub.EpubNav)]
 
-        with tqdm(docs, unit="xhtml", dynamic_ncols=True) as bar:
-            for item in bar:
+        # 預算總字數（從 ZIP 中央目錄讀 file_size，不需二次讀檔）
+        total_bytes = 0
+        for item in docs:
+            try:
+                total_bytes += self._zipfile.getinfo(self._epub_root + item.get_name()).file_size
+            except KeyError:
+                total_bytes += len(item.get_content())
+
+        with tqdm(total=total_bytes, unit="字", unit_scale=True, dynamic_ncols=True) as bar:
+            for item in docs:
                 name = item.get_name()
                 if verbose:
                     bar.set_description(name)
@@ -206,6 +214,7 @@ class EpubProcessor:
                     new_content = process_xhtml(raw, translator, postprocessor, self._text_pairs)
                     item.set_content(new_content)
                     item.get_content = lambda _bytes=new_content, default=None: _bytes
+                    bar.update(len(raw))
                 except Exception as e:
                     tqdm.write(f"  ⚠️  跳過 {name}: {e}")
 
