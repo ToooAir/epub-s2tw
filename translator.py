@@ -37,6 +37,7 @@ class Translator:
         self.total_http      = 0   # 實際 HTTP 請求次數
         self.total_chars     = 0
         self.fallback_count  = 0   # 遭遇漏句幻覺的降級次數
+        self._fallback_log: list[tuple[str, str, str]] = []  # (source, hallucinated, fixed)
 
         self._session = requests.Session()
 
@@ -123,8 +124,10 @@ class Translator:
                 orig_text = miss_texts[arr_i]
                 if self.use_free and self._needs_fallback(orig_text, val, fmt):
                     self.fallback_count += 1
+                    hallucinated = val
                     val = self._fallback_sentence_translation(orig_text)
                     translated[arr_i] = val
+                    self._fallback_log.append((orig_text, hallucinated, val))
                     
                 results[orig_i] = val
                 self._store(self._key(orig_text, fmt), val, len(orig_text))
@@ -133,6 +136,21 @@ class Translator:
             self._save_cache()
 
         return results
+
+    def clear_fallback_log(self):
+        self._fallback_log.clear()
+        self.fallback_count = 0
+
+    def append_fallback_log(self, path: str):
+        if not self._fallback_log:
+            return
+        lines = [f"\n\n=== NMT 幻覺紀錄 ({len(self._fallback_log)} 件) ===\n"]
+        for i, (src, bad, fixed) in enumerate(self._fallback_log, 1):
+            lines.append(f"\n[{i:03d}] 原文：\n  {src}\n")
+            lines.append(f"      幻覺：\n  {bad}\n")
+            lines.append(f"      修正：\n  {fixed}\n")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("".join(lines))
 
     def close(self):
         self._save_cache()

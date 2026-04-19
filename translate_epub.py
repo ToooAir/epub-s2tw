@@ -73,11 +73,17 @@ def process_file(
         return False
 
     print(f"\n📖 {input_path.name}")
+    translator.clear_fallback_log()
+    postprocessor.clear_applied_log()
     try:
         proc = EpubProcessor(str(input_path))
         report_path = output_dir / f"{new_stem}_consistency.txt" if log_consistency else None
         proc.translate(translator, postprocessor=postprocessor, verbose=verbose, report_path=str(report_path) if report_path else None)
         proc.save(str(out_path))
+        if log_consistency and report_path:
+            if translator._fallback_log:
+                translator.append_fallback_log(str(report_path))
+            postprocessor.write_applied_log(str(report_path))
         print(f"  ✅ → {out_path.name}")
         return True
     except Exception as e:
