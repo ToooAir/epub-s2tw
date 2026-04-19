@@ -355,55 +355,66 @@ class EpubProcessor:
         # 全書 VIP 門檻：至少 15 次，若書本極長則隨書本長度提升 (每 50 個段落提高 1 次出鏡要求)
         entity_thresh = max(15, pair_count // 50)
 
+        # 句子分割：在句號/感嘆/問號/省略號後切開，讓 n-gram 配對在句子層級進行
+        # 若來源與目標切出的句數一致，改用句子對；否則退回段落對，避免錯位
+        _sent_re = re.compile(r'(?<=[。！？…\n])\s*')
+
+        def _sentence_pairs(src: str, tgt: str):
+            ss = [s for s in _sent_re.split(src) if s.strip()]
+            ts = [t for t in _sent_re.split(tgt) if t.strip()]
+            if len(ss) == len(ts) and len(ss) > 1:
+                return zip(ss, ts)
+            return [(src, tgt)]
+
         for src, tgt in self._text_pairs:
-            # 建立 target n-gram 索引：(長度, 首字) → set(t_ng)
-            # 用首字做第一層過濾，把候選從 O(全 n-gram) 降到 O(幾個)
-            tgt_idx: dict[tuple[int, str], set[str]] = defaultdict(set)
-            for n in range(3, 5):
-                for j in range(len(tgt) - n + 1):
-                    t_ng = tgt[j:j+n]
-                    if cjk.match(t_ng):
-                        tgt_idx[(n, t_ng[0])].add(t_ng)
+            for _src, _tgt in _sentence_pairs(src, tgt):
+                # 建立 target n-gram 索引：(長度, 首字) → set(t_ng)
+                # 用首字做第一層過濾，把候選從 O(全 n-gram) 降到 O(幾個)
+                tgt_idx: dict[tuple[int, str], set[str]] = defaultdict(set)
+                for n in range(3, 5):
+                    for j in range(len(_tgt) - n + 1):
+                        t_ng = _tgt[j:j+n]
+                        if cjk.match(t_ng):
+                            tgt_idx[(n, t_ng[0])].add(t_ng)
 
-            # 每個 (s_ng, t_ng) 對在本段落只計一次
-            local_pairs: set[tuple[str, str]] = set()
-            for n in range(3, 5):
-                for i in range(len(src) - n + 1):
-                    s_ng = src[i:i+n]
-                    if not cjk.match(s_ng):
-                        continue
-                    sc0 = s_ng[0]
-                    is_all_fixed = all(sc not in s2t_keys for sc in s_ng)
-                    
-                    if sc0 not in s2t_keys:
-                        # 固定首字：target 以同字開頭
-                        candidates = tgt_idx.get((n, sc0), _EMPTY)
-                    else:
-                        # 轉換首字：target 以各 s2t 對應形式開頭
-                        candidates = set()
-                        for tc0 in s2t.get(sc0, ()):
-                            candidates |= tgt_idx.get((n, tc0), _EMPTY)
-                    for t_ng in candidates:
-                        if (s_ng, t_ng) not in local_pairs and _plausible(s_ng, t_ng, s2t, is_all_fixed):
-                            # 反向碰撞檢查 (Competitive Alignment)：
-                            # 若 t_ng (如 艾莉亞) 與本段落中另一個原文 s_alt (如 艾莉娅) 的字元差異數，
-                            # 小於或等於它與 s_ng (如 艾莉莎) 的差異數，表示該翻譯有歧義，放棄歸屬！
-                            if is_all_fixed and s_ng != t_ng:
-                                my_diff = sum(1 for a, b in zip(s_ng, t_ng) if a != b)
-                                ambiguous = False
-                                for j in range(len(src) - n + 1):
-                                    s_alt = src[j:j+n]
-                                    if s_alt != s_ng:
-                                        alt_diff = sum(1 for a, b in zip(s_alt, t_ng) if a != b)
-                                        if alt_diff <= my_diff:
-                                            ambiguous = True
-                                            break
-                                if ambiguous:
-                                    continue
-                            local_pairs.add((s_ng, t_ng))
+                # 每個 (s_ng, t_ng) 對在本句只計一次
+                local_pairs: set[tuple[str, str]] = set()
+                for n in range(3, 5):
+                    for i in range(len(_src) - n + 1):
+                        s_ng = _src[i:i+n]
+                        if not cjk.match(s_ng):
+                            continue
+                        sc0 = s_ng[0]
+                        is_all_fixed = all(sc not in s2t_keys for sc in s_ng)
 
-            for s_ng, t_ng in local_pairs:
-                src_to_tgt[s_ng][t_ng] += 1
+                        if sc0 not in s2t_keys:
+                            # 固定首字：target 以同字開頭
+                            candidates = tgt_idx.get((n, sc0), _EMPTY)
+                        else:
+                            # 轉換首字：target 以各 s2t 對應形式開頭
+                            candidates = set()
+                            for tc0 in s2t.get(sc0, ()):
+                                candidates |= tgt_idx.get((n, tc0), _EMPTY)
+                        for t_ng in candidates:
+                            if (s_ng, t_ng) not in local_pairs and _plausible(s_ng, t_ng, s2t, is_all_fixed):
+                                # 反向碰撞檢查 (Competitive Alignment)：
+                                # 若 t_ng 與本句另一個原文 s_alt 的差異數 ≤ 與 s_ng 的差異數，表示歧義，放棄歸屬
+                                if is_all_fixed and s_ng != t_ng:
+                                    my_diff = sum(1 for a, b in zip(s_ng, t_ng) if a != b)
+                                    ambiguous = False
+                                    for j in range(len(_src) - n + 1):
+                                        s_alt = _src[j:j+n]
+                                        if s_alt != s_ng:
+                                            alt_diff = sum(1 for a, b in zip(s_alt, t_ng) if a != b)
+                                            if alt_diff <= my_diff:
+                                                ambiguous = True
+                                                break
+                                    if ambiguous:
+                                        continue
+                                local_pairs.add((s_ng, t_ng))
+
+                for s_ng, t_ng in local_pairs:
+                    src_to_tgt[s_ng][t_ng] += 1
 
         # ── 2. 找出翻譯不一致的原文 n-gram ───────────────────────────
         def _is_valid_replacement(s_ng: str, wrong: str, right: str, s2t: dict, is_all_fixed: bool, total_count: int, entity_thresh: int) -> bool:
@@ -466,18 +477,31 @@ class EpubProcessor:
             for t_ng, count in tgt_counts.items():
                 if t_ng == majority_tgt:
                     continue
-                    
+
                 # 【全域防撞機制】：若此候選本身就是本書其他合法名詞的正解（例如雙胞胎），絕不能抹除它！
                 if t_ng in global_legitimate_targets:
                     continue
-                    
-                # 如果是真理模式，無視少數派比例強制清除 AI 幻覺；否則受限於容錯閾值
+
+                # 【來源合法性防護】：若少數派譯文本身是原文常見 n-gram，它是獨立合法詞彙而非幻覺錯字
+                # 例：「一如既」在原文有「一如既往」，「政近走」在原文有「政近走出」，不應被多數決覆蓋
+                if t_ng in src_to_tgt and sum(src_to_tgt[t_ng].values()) >= min_total:
+                    continue
+
+                # min_minority 適用於所有模式（含絕對真理），避免極低頻雜訊觸發修正
+                if count < min_minority:
+                    continue
+
+                # 絕對真理模式：3-char 全固定詞仍需 VIP 門檻（與 _is_valid_replacement 對稱）
+                if is_all_fixed and majority_tgt == s_ng and len(s_ng) == 3 and total < entity_thresh:
+                    continue
+
+                # 非絕對真理模式：額外比例與字形驗證
                 if not (is_all_fixed and majority_tgt == s_ng):
-                    if count < min_minority or count / total >= max_minor_ratio:
+                    if count / total >= max_minor_ratio:
                         continue
                     if not _is_valid_replacement(s_ng, t_ng, majority_tgt, s2t, is_all_fixed, total, entity_thresh):
                         continue
-                    # Fix 3：wrong 和 right 都是原文 n-gram 的合法 s2t 繁體 →
+                    # wrong 和 right 都是原文 n-gram 的合法 s2t 繁體 →
                     # 這是歧義字（如 发→發/髮），語意取決於上下文，交給 postprocessor 負責
                     if all(
                         wc == rc
@@ -485,8 +509,10 @@ class EpubProcessor:
                         for sc, wc, rc in zip(s_ng, t_ng, majority_tgt)
                     ):
                         continue
-                    normalization[t_ng] = majority_tgt
-                    wrong_to_source[t_ng] = s_ng
+
+                # 兩個模式都抵達此處才寫入（修正：原本在 if 塊內，絕對真理模式的寫入被跳過）
+                normalization[t_ng] = majority_tgt
+                wrong_to_source[t_ng] = s_ng
 
         if not normalization:
             return
@@ -638,6 +664,31 @@ class EpubProcessor:
                     patched = result.encode("utf-8")
                     item.set_content(patched)
                     item.get_content = lambda b=patched, d=None: b
+            except Exception:
+                continue
+
+        # ── 3b. 對 NCX 套用同一份 normalization（補完目錄頁的一致性）────
+        for ncx_item in self.book.get_items():
+            if not ncx_item.get_name().lower().endswith(".ncx"):
+                continue
+            try:
+                ncx_bytes = ncx_item.get_content()
+                ncx_str = ncx_bytes.decode("utf-8", errors="ignore")
+                if not any(wrong in ncx_str for wrong, _ in sorted_norm):
+                    continue
+                ncx_soup = BeautifulSoup(ncx_bytes, "lxml-xml")
+                ncx_changed = False
+                for text_node in ncx_soup.find_all("text"):
+                    new_text = str(text_node.string or "")
+                    original_text = new_text
+                    for wrong, right in sorted_norm:
+                        if wrong in new_text:
+                            new_text = new_text.replace(wrong, right)
+                    if new_text != original_text:
+                        text_node.string = new_text
+                        ncx_changed = True
+                if ncx_changed:
+                    ncx_item.set_content(str(ncx_soup).encode("utf-8"))
             except Exception:
                 continue
 
