@@ -82,6 +82,7 @@ python translate_epub.py -d ./books
 | `-k KEY` | 直接傳入 API Key |
 | `--no-rename` | 不把輸出檔名轉為繁體 |
 | `--log-consistency` | 輸出一致性修正報告 (`_consistency.txt`) |
+| `--ckip` | 啟用 CKIP albert-tiny 雙重詞界確認（需安裝 `ckip-transformers`）|
 | `-v` | 顯示每個 XHTML 的處理進度 |
 | `--dry-run` | 只列出會處理的檔案，不實際翻譯 |
 | `--clear-cache` | 清除全域快取 `.translate_cache.json` |
@@ -117,6 +118,16 @@ python translate_epub.py -d ./books --free
 如「剩餘價值」被翻成「剩馀價值」等 Google 系統性詞彙翻譯錯誤。這類專屬補丁收錄於 `corrections.json` 中，支援手動維護。
 
 後處理採 **single-pass 最長匹配**掃描，每個位置只處理一次，避免多條規則連鎖衝突。
+
+**Layer 1 / Layer 2 分層保護：**
+- `corrections.json`（Layer 1）為人工驗證的已知錯誤，**不受 bigram 邊界保護限制**，無條件套用。
+- MOE 生成規則（Layer 2）才受 bigram 保護，避免誤傷合法詞彙。
+
+**（可選）CKIP 雙重詞界確認：**
+啟用 `--ckip` 後，Layer 2 的 bigram 攔截會加入第二道驗證——以 `ckip-transformers albert-tiny` 斷詞器確認是否真的跨詞界，兩者皆同意才跳過，任一放行則套用修正，大幅降低 bigram 誤傷率。
+
+**Bigram 攔截 Log（`--log-consistency`）：**
+報告末尾會附上「Bigram 攔截紀錄」，列出匹配成功但被攔截的規則與上下文，供人工確認是否需補入 `corrections.json`。
 
 ### 更新 corrections.json
 

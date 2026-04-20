@@ -13,3 +13,7 @@ python-dotenv>=1.0.0
 
 # 進度條
 tqdm>=4.66.0
+
+# （可選）CKIP albert-tiny 雙重詞界確認，降低 bigram 誤傷率
+# 安裝後使用 --ckip 啟用；首次執行會從 HuggingFace 自動下載模型快取
+# ckip-transformers>=0.3.0

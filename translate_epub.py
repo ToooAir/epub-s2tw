@@ -84,6 +84,7 @@ def process_file(
             if translator._fallback_log:
                 translator.append_fallback_log(str(report_path))
             postprocessor.write_applied_log(str(report_path))
+            postprocessor.write_blocked_log(str(report_path))
         print(f"  ✅ → {out_path.name}")
         return True
     except Exception as e:
@@ -121,6 +122,8 @@ def main():
                         help="只列出會處理的檔案，不實際翻譯")
     parser.add_argument("--clear-cache", action="store_true",
                         help="清除已儲存的翻譯快取 (.translate_cache.json)")
+    parser.add_argument("--ckip", action="store_true",
+                        help="啟用 ckip-transformers albert-tiny 雙重詞界確認（降低 bigram 誤傷）")
     args = parser.parse_args()
 
     if args.clear_cache:
@@ -181,6 +184,9 @@ def main():
         target  = "zh-TW",
     )
     postprocessor = PostProcessor()
+    if args.ckip:
+        postprocessor.enable_ckip()
+        print("✓ CKIP albert-tiny 斷詞器已啟用")
     print(f"✓ 後處理器載入：{postprocessor.stats()}")
 
     success = fail = 0
