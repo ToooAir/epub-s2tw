@@ -203,7 +203,7 @@ class Translator:
         這能強制切斷 Google NMT 翻譯高重複疊詞時會陷入的無限迴圈（Attention Hallucination），
         同時避免「機關槍掃射」發送數十個 HTTP Requests 導致 500 Error。
         """
-        parts = re.split(r'([。！？…\!\?\n]+)', text)
+        parts = re.split(r'([。！？…\!\?\.\n]+)', text)
         
         # 將標點與句子貼合
         sentences = []

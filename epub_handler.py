@@ -46,6 +46,142 @@ def _has_inline(tag) -> bool:
     return bool(tag.find(INLINE_TAGS))
 
 
+# ── Opaque-inline sentinel substitution ──────────────────────────────
+# 翻譯前將無文字內容的 inline 元素（如 <a><img/></a> 腳注錨點）替換為
+# 私用區 Unicode sentinel，翻譯後還原，避免 NMT 看到雜訊產生幻覺。
+#
+# 擴充：使用啟發式規則判斷「語意 opaque」元素（如人名、書名、章首數字等），
+# 即使有文字內容也整體 sentinel 化，防止 NMT 產生幻覺（如 户冢彩加 → 戶口吃…）。
+
+_SENTINEL_L = "\uE000"   # Unicode Private Use Area，NMT 幾乎不翻譯
+_SENTINEL_R = "\uE001"
+_SENTINEL_RE = re.compile(r"\uE000(\d+)\uE001")
+
+# 日文假名（會出現在人名旁）
+_HAS_KANA = re.compile(r'[\u3040-\u30FF]')
+# 純中文人名特徵：2~6 個漢字，無標點
+_CHINESE_NAME_LIKE = re.compile(r'^[\u4E00-\u9FFF·•‧]{2,6}$')
+# 全大寫 / 片假名長串（英文人名、日文外來語人名）
+_KATAKANA_NAME = re.compile(r'^[\u30A0-\u30FF]{2,}$')
+# 西里爾字母（俄文）特徵（允許包含標點與空白）
+_RUSSIAN_TEXT = re.compile(r'^[\u0400-\u04FF\s\,\.\!\?\'\"「」]+$')
+
+# 語意關鍵字，子串包含即視為 opaque
+_OPAQUE_CLASS_KEYWORDS: frozenset[str] = frozenset({
+    "name",      # char-name, person-name, illus-name, ruby-name...
+    "title",     # book-title, vol-title...
+    "ruby",      # ruby-base, ruby-text...
+    "con-box",   # con-box, con-box2（章節編號）
+    "chara",     # chara, character
+    "author",
+    "illus",     # illustrator name
+    "label",     # section label
+    "num",       # chapter number
+    "index",     # index markers
+})
+
+
+def _is_structurally_opaque(el) -> bool:
+    """
+    結構上屬於 opaque 的 inline 元素：
+    - 無任何文字節點（只有圖片、span 等空殼）
+    - 是 <ruby> 標籤（底字 + 注音，整體應 sentinel 化）
+    """
+    if not el.get_text().strip():
+        return True
+    if el.name == "ruby":
+        return True
+    return False
+
+
+def _is_opaque_class(el) -> bool:
+    """Class 名稱語意比對（模糊匹配，跨書通用）"""
+    classes = el.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return any(
+        any(keyword in cls.lower() for keyword in _OPAQUE_CLASS_KEYWORDS)
+        for cls in classes
+    )
+
+
+def _is_content_opaque(el) -> bool:
+    """根據文字內容特徵判斷是否為人名/書名等專有名詞。"""
+    text = el.get_text().strip()
+    if not text:
+        return False
+    if _CHINESE_NAME_LIKE.match(text):
+        return True
+    if _KATAKANA_NAME.match(text):
+        return True
+    if _RUSSIAN_TEXT.match(text):
+        return True
+    # 短文字 + 有假名 → 可能是帶注音的人名
+    if len(text) <= 8 and _HAS_KANA.search(text):
+        return True
+    return False
+
+
+def _is_opaque_by_context(el) -> bool:
+    """父元素是 opaque class → 子 inline 元素也應 sentinel 化。"""
+    parent = el.parent
+    if parent and hasattr(parent, "get"):
+        return _is_opaque_class(parent)
+    return False
+
+
+def _is_opaque(el) -> bool:
+    """
+    通用 opaque 偵測，取代硬編碼的 OPAQUE_CLASSES。
+    優先序：結構 > class 關鍵字 > 內容啟發式 > 父層上下文
+    """
+    return (
+        _is_structurally_opaque(el)
+        or _is_opaque_class(el)
+        or _is_content_opaque(el)
+        or _is_opaque_by_context(el)
+    )
+
+
+def _collect_opaque_roots(tag) -> list:
+    """DFS 收集最外層的 opaque inline 元素。"""
+    results = []
+    def _walk(el):
+        for child in list(el.children):
+            if not hasattr(child, "name") or not child.name:
+                continue
+            if child.name in BLOCK_TAGS:
+                _walk(child)
+                continue
+            if _is_opaque(child):
+                results.append(child)
+            else:
+                _walk(child)
+    _walk(tag)
+    return results
+
+
+def _apply_opaque_sentinels(tag) -> list[str]:
+    """將 opaque inline 元素替換為 sentinel（原地修改 tag）。
+    回傳原始元素 HTML 字串的有序清單，供還原使用。
+    """
+    mapping: list[str] = []
+    for el in _collect_opaque_roots(tag):
+        mapping.append(str(el))
+        el.replace_with(f"{_SENTINEL_L}{len(mapping) - 1}{_SENTINEL_R}")
+    return mapping
+
+
+def _restore_opaque_sentinels(html: str, mapping: list[str]) -> str:
+    """將 sentinel token 置換回原始元素 HTML。"""
+    if not mapping:
+        return html
+    def _sub(m: re.Match) -> str:
+        idx = int(m.group(1))
+        return mapping[idx] if idx < len(mapping) else m.group(0)
+    return _SENTINEL_RE.sub(_sub, html)
+
+
 def _replace_inner_html(tag, new_html: str):
     """把 tag 的內容替換為 new_html（保留 tag 本身）。"""
     tag.clear()
@@ -100,8 +236,8 @@ def process_xhtml(content: bytes, translator, postprocessor=None, pairs_collecto
     except Exception:
         soup = BeautifulSoup(decoded, "html.parser")
 
-    plain_segs = []   # (tag, text)        → 純文字批次翻譯
-    html_segs  = []   # (tag, inner_html)  → HTML 格式翻譯
+    plain_segs = []   # (tag, text)                      → 純文字批次翻譯
+    html_segs  = []   # (tag, inner_html, sentinel_map)  → HTML 格式翻譯
 
     for tag in soup.find_all(BLOCK_TAGS):
         # 跳過在 script / code / rt 等標籤內的元素
@@ -109,9 +245,12 @@ def process_xhtml(content: bytes, translator, postprocessor=None, pairs_collecto
             continue
 
         if _has_inline(tag):
+            if not tag.get_text().strip():
+                continue  # 僅含 opaque 元素（如獨立腳注錨點），無需翻譯
+            mapping = _apply_opaque_sentinels(tag)
             inner = tag.decode_contents()
             if inner.strip():
-                html_segs.append((tag, inner))
+                html_segs.append((tag, inner, mapping))
         else:
             text = tag.get_text()
             if text.strip():
@@ -139,9 +278,10 @@ def process_xhtml(content: bytes, translator, postprocessor=None, pairs_collecto
 
     # HTML 格式翻譯（含 inline 標籤）
     if html_segs:
-        html_texts      = [h for _, h in html_segs]
+        html_texts      = [h for _, h, _ in html_segs]
         translated_html = translator.translate_batch(html_texts, fmt="html")
-        for (tag, orig_html), new_html in zip(html_segs, translated_html):
+        for (tag, orig_html, mapping), new_html in zip(html_segs, translated_html):
+            new_html   = _restore_opaque_sentinels(new_html, mapping)
             final_html = pp.apply(new_html) if pp else new_html
             _replace_inner_html(tag, final_html)
             if pairs_collector is not None:
