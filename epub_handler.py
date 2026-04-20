@@ -59,10 +59,8 @@ _SENTINEL_RE = re.compile(r"\uE000(\d+)\uE001")
 
 # 日文假名（會出現在人名旁）
 _HAS_KANA = re.compile(r'[\u3040-\u30FF]')
-# 純中文人名特徵：2~6 個漢字，無標點
-_CHINESE_NAME_LIKE = re.compile(r'^[\u4E00-\u9FFF·•‧]{2,6}$')
 # 全大寫 / 片假名長串（英文人名、日文外來語人名）
-_KATAKANA_NAME = re.compile(r'^[\u30A0-\u30FF]{2,}$')
+_KATAKANA_NAME = re.compile(r'^[\u30A0-\u30FF]{3,}$')
 # 西里爾字母（俄文）特徵（允許包含標點與空白）
 _RUSSIAN_TEXT = re.compile(r'^[\u0400-\u04FF\s\,\.\!\?\'\"「」]+$')
 
@@ -110,8 +108,6 @@ def _is_content_opaque(el) -> bool:
     text = el.get_text().strip()
     if not text:
         return False
-    if _CHINESE_NAME_LIKE.match(text):
-        return True
     if _KATAKANA_NAME.match(text):
         return True
     if _RUSSIAN_TEXT.match(text):
