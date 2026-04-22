@@ -297,6 +297,7 @@ def scan_protected_entities(
                         continue
                     if s_ng in moe_words:
                         continue
+                    # 全字元皆需為固定字（無繁簡差異），確保 sentinel 還原後不需要 s2t 轉換
                     if all(sc not in s2t_keys for sc in s_ng):
                         counter[s_ng] += 1
                         
@@ -405,7 +406,18 @@ def process_xhtml(
         translated_html = translator.translate_batch(html_texts, fmt="html")
         for (tag, orig_html, mapping), new_html in zip(html_segs, translated_html):
             new_html   = _restore_opaque_sentinels(new_html, mapping)
-            final_html = pp.apply(new_html) if pp else new_html
+            # 逐文字節點套用後處理，避免 pp.apply() 扫描到 HTML tag 字元
+            if pp:
+                soup_tmp = BeautifulSoup(new_html, "html.parser")
+                for node in soup_tmp.find_all(string=True):
+                    if node.parent and node.parent.name in SKIP_ANCESTOR:
+                        continue
+                    corrected = pp.apply(str(node))
+                    if corrected != str(node):
+                        node.replace_with(corrected)
+                final_html = soup_tmp.decode_contents()
+            else:
+                final_html = new_html
             _replace_inner_html(tag, final_html)
             if pairs_collector is not None:
                 orig_text = BeautifulSoup(orig_html, "html.parser").get_text()
