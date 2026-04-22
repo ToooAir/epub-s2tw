@@ -217,9 +217,131 @@ def _plausible(s_ng: str, t_ng: str, s2t: dict, is_all_fixed: bool = False) -> b
     return True
 
 
+# ── 譯前命名實體保護 ───────────────────────────────────────────────────
+
+def _cliff_threshold(counts: dict[str, int], hard_floor: int) -> int:
+    """
+    從 N-gram 計數字典中，找出動態門檻以濾除低頻雜訊。
+    策略：
+    1. 尋找所有相鄰比值 >= 2.0 的「斷層」，採用「最後一個斷層」的上界。
+       這能有效包容多個梯隊（如：主角群 600次 -> 配角 175次 -> 雜訊 70次，會停在 175）
+    2. 若無明顯斷層，則採用最高頻詞的 15% 作為相對門檻（Zipf's law 經驗法則）。
+    保底：回傳值絕不低於 hard_floor。
+    """
+    if not counts:
+        return hard_floor
+        
+    sorted_counts = sorted(counts.values(), reverse=True)
+    if len(sorted_counts) <= 1:
+        return hard_floor
+        
+    best_cut_value = sorted_counts[0]
+    found_cliff = False
+    
+    for i in range(len(sorted_counts) - 1):
+        if sorted_counts[i + 1] == 0:
+            continue
+        ratio = sorted_counts[i] / sorted_counts[i + 1]
+        # 只要發生超過兩倍的斷崖式下跌，我們就把防線推進到這裡
+        if ratio >= 2.0:
+            best_cut_value = sorted_counts[i]
+            found_cliff = True
+            
+    if found_cliff:
+        return max(best_cut_value, hard_floor)
+        
+    # 若分佈太平滑，無顯著斷層，改用最高頻的 15% 作為門檻
+    max_val = sorted_counts[0]
+    relative_threshold = int(max_val * 0.15)
+    return max(relative_threshold, hard_floor)
+
+
+def scan_protected_entities(
+    raw_docs: list[bytes],
+    s2t_keys: frozenset[str],
+    min_freq: int = 8,
+    ng_range: tuple = (2, 4),
+    moe_words: frozenset[str] = frozenset()
+) -> dict[str, int]:
+    """掃描全書，找出高頻且不需繁簡轉換的固定詞（如人名）。"""
+    cjk = re.compile(r'^[\u4e00-\u9fff\u3400-\u4dbf]+$')
+    counter = Counter()
+    
+    # 過濾常見語法助詞與代名詞，避免切碎句子結構
+    stop_chars = set("的了着在是不也就和与到以得真啊喔哎一我你他她它这那哪其个们些么")
+
+    
+    for raw in raw_docs:
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            decoded = raw.decode("utf-8", errors="replace")
+        try:
+            soup = BeautifulSoup(decoded, "lxml-xml")
+        except Exception:
+            soup = BeautifulSoup(decoded, "html.parser")
+            
+        for tag in soup.find_all(BLOCK_TAGS):
+            if any(p.name in SKIP_ANCESTOR for p in tag.parents):
+                continue
+            text = tag.get_text()
+            if not text.strip():
+                continue
+            
+            for n in range(ng_range[0], ng_range[1] + 1):
+                for i in range(len(text) - n + 1):
+                    s_ng = text[i:i+n]
+                    if not cjk.match(s_ng):
+                        continue
+                    if any(c in stop_chars for c in s_ng):
+                        continue
+                    if s_ng in moe_words:
+                        continue
+                    if all(sc not in s2t_keys for sc in s_ng):
+                        counter[s_ng] += 1
+                        
+    # 僅對初步達標（>= min_freq）的候選詞套用動態斷層過濾
+    candidates = {s: c for s, c in counter.items() if c >= min_freq}
+    dynamic_threshold = _cliff_threshold(candidates, hard_floor=min_freq)
+    
+    entities = {}
+    for s_ng, count in candidates.items():
+        if count >= dynamic_threshold:
+            entities[s_ng] = count
+    return entities
+
+
+def _inject_entity_guards(tag, entities, pattern: re.Pattern):
+    """將 tag 內的保護詞彙用 <span class="notranslate-name"> 包起來。"""
+    from bs4 import NavigableString
+    import html
+    text_nodes = [t for t in tag.find_all(string=True) if isinstance(t, NavigableString)]
+    
+    for node in text_nodes:
+        if any(p.name in SKIP_ANCESTOR for p in node.parents):
+            continue
+        text = str(node)
+        if not text.strip():
+            continue
+            
+        parts = pattern.split(text)
+        if len(parts) > 1:
+            new_html = ""
+            for i, part in enumerate(parts):
+                if i % 2 == 1:
+                    new_html += f'<span class="notranslate-name">{part}</span>'
+                else:
+                    new_html += html.escape(part)
+            parsed = BeautifulSoup(new_html, "html.parser")
+            node.replace_with(parsed)
+
+
 # ── 主要處理函式 ───────────────────────────────────────────────────────
 
-def process_xhtml(content: bytes, translator, postprocessor=None, pairs_collector: list | None = None) -> bytes:
+def process_xhtml(
+    content: bytes, translator, postprocessor=None, pairs_collector: list | None = None,
+    entities: dict | None = None, entities_pattern: re.Pattern | None = None
+) -> bytes:
     """翻譯一個 XHTML 文件的內容並回傳修改後的 bytes。"""
     try:
         decoded = content.decode("utf-8")
@@ -234,6 +356,11 @@ def process_xhtml(content: bytes, translator, postprocessor=None, pairs_collecto
 
     plain_segs = []   # (tag, text)                      → 純文字批次翻譯
     html_segs  = []   # (tag, inner_html, sentinel_map)  → HTML 格式翻譯
+
+    if entities and entities_pattern:
+        for tag in soup.find_all(BLOCK_TAGS):
+            if not any(p.name in SKIP_ANCESTOR for p in tag.parents):
+                _inject_entity_guards(tag, entities, entities_pattern)
 
     for tag in soup.find_all(BLOCK_TAGS):
         # 跳過在 script / code / rt 等標籤內的元素
@@ -322,11 +449,33 @@ class EpubProcessor:
         opf_dir = opf_candidates[0].rsplit("/", 1)[0] + "/" if opf_candidates else ""
         self._epub_root = opf_dir  # e.g. "OEBPS/"
 
-    def translate(self, translator, postprocessor=None, verbose: bool = False, report_path: str | None = None):
+    def translate(self, translator, postprocessor=None, verbose: bool = False, report_path: str | None = None, protect_entities: bool = True):
         """翻譯整本 EPUB 的 HTML 文件與 metadata。"""
         docs = [i for i in self.book.get_items()
                 if i.get_type() == ebooklib.ITEM_DOCUMENT
                 and not isinstance(i, epub.EpubNav)]
+
+        # ── 預掃描：建立全書命名實體保護集合 ───────────────────────────
+        entities = {}
+        entities_pattern = None
+        all_raws = []
+        for item in docs:
+            try:
+                all_raws.append(self._zipfile.read(self._epub_root + item.get_name()))
+            except KeyError:
+                all_raws.append(item.get_content())
+                
+        if protect_entities:
+            s2t_keys = frozenset(postprocessor.s2t_map.keys()) if postprocessor else frozenset()
+            moe_words = postprocessor.moe_words if postprocessor and hasattr(postprocessor, "moe_words") else frozenset()
+            min_freq = max(8, len(docs))
+            entities = scan_protected_entities(all_raws, s2t_keys, min_freq=min_freq, moe_words=moe_words)
+            if entities:
+                sorted_entities = sorted(entities.keys(), key=len, reverse=True)
+                entities_pattern = re.compile("(" + "|".join(re.escape(e) for e in sorted_entities) + ")")
+                tqdm.write(f"  🛡️  命名實體保護：偵測到 {len(entities)} 個固定詞 (min_freq={min_freq})")
+                sample = list(entities.keys())[:8]
+                tqdm.write(f"       範例：{'、'.join(sample)}")
 
         # 預算總字數（從 ZIP 中央目錄讀 file_size，不需二次讀檔）
         total_bytes = 0
@@ -347,7 +496,7 @@ class EpubProcessor:
                         raw = self._zipfile.read(zip_path)
                     except KeyError:
                         raw = item.get_content()
-                    new_content = process_xhtml(raw, translator, postprocessor, self._text_pairs)
+                    new_content = process_xhtml(raw, translator, postprocessor, self._text_pairs, entities=entities, entities_pattern=entities_pattern)
                     item.set_content(new_content)
                     item.get_content = lambda _bytes=new_content, default=None: _bytes
                     bar.update(len(raw))
@@ -359,6 +508,17 @@ class EpubProcessor:
         self._translate_metadata(translator, postprocessor)
         s2t = postprocessor.s2t_map if postprocessor else {}
         self._consistency_pass(docs, s2t_map=s2t, report_path=report_path)
+
+        if report_path and entities:
+            try:
+                with open(report_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n\n=== 譯前命名實體保護 ({len(entities)} 詞) ===\n\n")
+                    f.write("  ↑ 以下高頻固定詞在送交 Google NMT 前被標籤隔離，成功避免了因斷詞錯誤導致的幻覺\n\n")
+                    sorted_entities = sorted(entities.keys(), key=lambda k: (-entities[k], len(k)))
+                    for idx, e in enumerate(sorted_entities, 1):
+                        f.write(f"[{idx:03d}] {e}  (出現 {entities[e]} 次)\n")
+            except Exception as e:
+                tqdm.write(f"  ⚠️  保護報告寫入失敗：{e}")
 
     def _translate_ncx(self, translator, postprocessor=None):
         """翻譯 toc.ncx 中的 <navLabel><text> 與 <docTitle><text>。"""

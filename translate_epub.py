@@ -63,6 +63,7 @@ def process_file(
     rename: bool = True,
     verbose: bool = False,
     log_consistency: bool = False,
+    protect_entities: bool = True,
 ) -> bool:
     stem     = input_path.stem.replace("_zhTW", "").strip()
     new_stem = to_trad_filename(stem) if rename else stem
@@ -78,7 +79,7 @@ def process_file(
     try:
         proc = EpubProcessor(str(input_path))
         report_path = output_dir / f"{new_stem}_consistency.txt" if log_consistency else None
-        proc.translate(translator, postprocessor=postprocessor, verbose=verbose, report_path=str(report_path) if report_path else None)
+        proc.translate(translator, postprocessor=postprocessor, verbose=verbose, report_path=str(report_path) if report_path else None, protect_entities=protect_entities)
         proc.save(str(out_path))
         if log_consistency and report_path:
             if translator._fallback_log:
@@ -124,6 +125,8 @@ def main():
                         help="清除已儲存的翻譯快取 (.translate_cache.json)")
     parser.add_argument("--ckip", action="store_true",
                         help="啟用 ckip-transformers albert-tiny 雙重詞界確認（降低 bigram 誤傷）")
+    parser.add_argument("--no-protect-entities", action="store_true",
+                        help="停用譯前高頻人名實體保護機制（預設為啟用）")
     args = parser.parse_args()
 
     if args.clear_cache:
@@ -195,7 +198,8 @@ def main():
             book_bar.set_description(f.stem[:30])
             ok = process_file(f, output_dir, translator, postprocessor,
                               rename=not args.no_rename, verbose=args.verbose,
-                              log_consistency=args.log_consistency)
+                              log_consistency=args.log_consistency,
+                              protect_entities=not args.no_protect_entities)
             if ok:
                 success += 1
             else:

@@ -26,6 +26,7 @@ class PostProcessor:
         self._s2t, self._corrections, self._manual_keys = self._build_corrections(
             corrections_path, stcharacters_path, twvariants_path, moe_headwords
         )
+        self.moe_words = moe_headwords
         # 按首字分組，長詞優先：加速 single-pass 掃描
         # Layer 1（corrections.json）不受 bigram 保護；Layer 2/3 受保護
         self._by_first_manual: dict[str, list] = {}  # Layer 1：不做 bigram 檢查
