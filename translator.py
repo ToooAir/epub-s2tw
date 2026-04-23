@@ -218,7 +218,9 @@ class Translator:
         tgt_simp = [c for c in tgt_cjk   if c in self._s2t_keys]
 
         survival_rate = len(tgt_simp) / len(src_simp)
-        return survival_rate > 0.20
+        # 門檻設 50%：只攔截真正完全沒翻譯的句子（≥50% 簡體字存活）
+        # Google 偶爾遺留 1-2 個簡體字（<30%）屬正常偏差，pp.apply() 後處理會修正
+        return survival_rate > 0.50
 
     def _fallback_sentence_translation(self, text: str) -> str:
         """
