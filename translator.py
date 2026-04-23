@@ -10,6 +10,7 @@ Google Translate wrapper — 支援兩種模式：
 
 import json
 import hashlib
+import os
 import time
 import re
 import threading
@@ -164,7 +165,7 @@ class Translator:
 
     FREE_CHUNK   = 1800  # 單次請求安全字元上限
     SEP          = "\n⚡\n"  # 批次合併用分隔符（翻譯後應原樣保留）
-    FREE_WORKERS = 5     # 並行請求數
+    FREE_WORKERS = min(8, (os.cpu_count() or 4) + 4)  # 並行請求數：依 CPU 核心數自動調整，上限 8
 
     def _needs_fallback(self, source: str, translated: str, fmt: str) -> bool:
         if not source or not str(source).strip():
