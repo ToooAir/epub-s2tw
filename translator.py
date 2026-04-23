@@ -38,6 +38,7 @@ class Translator:
         self.total_chars     = 0
         self.fallback_count  = 0   # 遭遇漏句幻覺的降級次數
         self._fallback_log: list[tuple[str, str, str]] = []  # (source, hallucinated, fixed)
+        self._s2t_keys: frozenset = frozenset()  # 简體字元集合，由外部注入，用於靈淣漏譯偵測
 
         self._session = requests.Session()
 
@@ -197,6 +198,27 @@ class Translator:
 
         return False
 
+    def _is_silent_passthrough(self, source: str, translated: str) -> bool:
+        """
+        利用 s2t_keys 作為通用簡體字偵測器，判斷 Google NMT 是否發生靈淣漏譯。
+        原理：原文為簡體，必然含大量 s2t_keys 中的「需轉換字」。
+        正確翻譯後這些字應全數消失；若殘存率 > 20% ，代表翻譯失敗。
+        """
+        if not self._s2t_keys:
+            return False
+
+        src_cjk  = [c for c in source    if '\u4e00' <= c <= '\u9fff']
+        src_simp = [c for c in src_cjk   if c in self._s2t_keys]
+
+        if len(src_cjk) < 5 or len(src_simp) < 3:
+            return False  # 太短或簡體字不足，無法可靠偵測
+
+        tgt_cjk  = [c for c in translated if '\u4e00' <= c <= '\u9fff']
+        tgt_simp = [c for c in tgt_cjk   if c in self._s2t_keys]
+
+        survival_rate = len(tgt_simp) / len(src_simp)
+        return survival_rate > 0.20
+
     def _fallback_sentence_translation(self, text: str) -> str:
         """
         將長文切成短句後，以 ⚡ 分隔連成「單一請求」送出。
@@ -304,7 +326,18 @@ class Translator:
                     parts = translated.split(self.SEP)
                     time.sleep(0.05)
                     if len(parts) == len(indices):
-                        return list(zip(indices, parts))
+                        # [Plan C] 逐子段驗證：只重譯發現靜默漏譯的那一小段
+                        result = []
+                        source_parts = [texts[i] for i in indices]
+                        for idx, src, tgt in zip(indices, source_parts, parts):
+                            if self._is_silent_passthrough(src, tgt):
+                                self.fallback_count += 1
+                                fixed = self._fallback_sentence_translation(src)
+                                self._fallback_log.append((src, tgt, fixed))
+                                result.append((idx, fixed))
+                            else:
+                                result.append((idx, tgt))
+                        return result
                     # 分隔符丟失，退回逐條翻譯
                     tqdm.write(f"  ⚠️  分隔符丟失（期望 {len(indices)} 段，得到 {len(parts)} 段），改逐條翻譯")
                     return [(idx, self._free_single(texts[idx])) for idx in indices]

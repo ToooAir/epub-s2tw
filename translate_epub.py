@@ -191,6 +191,8 @@ def main():
         postprocessor.enable_ckip()
         print("✓ CKIP albert-tiny 斷詞器已啟用")
     print(f"✓ 後處理器載入：{postprocessor.stats()}")
+    # 注入 s2t_keys，讓碎紙機具備通用靜默漏譯偵測能力
+    translator._s2t_keys = frozenset(postprocessor.s2t_map.keys())
 
     success = fail = 0
     with tqdm(epub_files, unit="本", dynamic_ncols=True) as book_bar:
