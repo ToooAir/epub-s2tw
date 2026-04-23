@@ -83,7 +83,7 @@ python translate_epub.py -d ./books
 | `-k KEY` | 直接傳入 API Key |
 | `--no-rename` | 不把輸出檔名轉為繁體 |
 | `--no-protect-entities` | 停用譯前高頻人名實體保護機制（預設為啟用） |
-| `--log-consistency` | 輸出一致性修正報告 (`_consistency.txt`) |
+| `--log-consistency` | 輸出一致性修正報告 (`_consistency.txt`)，同時包含譯前實體保護的詞彙清單與出現次數 |
 | `--ckip` | 啟用 CKIP albert-tiny 雙重詞界確認（需安裝 `ckip-transformers`）|
 | `-v` | 顯示每個 XHTML 的處理進度 |
 | `--dry-run` | 只列出會處理的檔案，不實際翻譯 |
@@ -92,14 +92,20 @@ python translate_epub.py -d ./books
 ### 完整範例
 
 ```bash
-# 預覽會處理哪些檔案（確認不含 output）
-python translate_epub.py -d . --dry-run
+# 預覽會處理哪些檔案(books)（確認不含 output）
+python translate_epub.py -d ./books --dry-run
 
-# 免費版翻譯整個資料夾，顯示詳細進度
-python translate_epub.py -d ./books --free -v -o ./繁體輸出
+# 免費版翻譯整個資料夾(books)到輸出資料夾(output)，顯示詳細進度
+python translate_epub.py -d ./books --free -v -o ./output
 
-# 重跑（已存在的輸出會自動跳過）
-python translate_epub.py -d ./books --free
+# 檢查輸出檔案一致性(books -> output)
+python translate_epub.py -d ./books --free -o ./output  --log-consistency
+
+# 檢查輸出檔案一致性(books -> output)（使用 CKIP）
+python translate_epub.py -d ./books --free -o ./output  --log-consistency --ckip
+
+# 檢查輸出檔案一致性(books -> output)（使用 CKIP）並清除快取
+python translate_epub.py -d ./books --free -o ./output  --log-consistency --ckip --clear-cache
 ```
 
 ## 後處理層
@@ -183,7 +189,12 @@ python translate_epub.py -d ./books --free
 
 - 單次請求上限約 1800 字元，自動切塊，多段合併並行請求大幅提速。
 - **神經網路幻覺防護 (NMT Fallback)**：當遇到角色語調激動（包含大量重複字眼如「我知道...我知道...我知道！」）時，Google 翻譯極易陷入迴圈，發生造詞幻覺或直接吃句（截斷）。
-- **異常偵測與閃電隔離重譯 (碎紙機狙擊槍)**：一旦偵測到文字長度異常流失 (>15%) 或是句尾標點消失，終端機會拋出警告，並觸發自救機制：將該段落物理切碎，塞入 `⚡` 分隔符號強制切斷 NMT 注意力機制後，以單一請求一次性發送。這不僅完美繞過漏句 Bug，更免去了 HTTP 500 擋刷限流，達成極致的重譯效能提升。
+- **異常偵測與閃電隔離重譯 (碎紙機狙擊槍)**：三道防線層層把關，任一觸發即啟動重譯自救：
+  - **文字長度異常流失（>15%）**：NMT 截斷句子時最直接的信號。
+  - **句尾標點消失**：引號、句號、問號等消失代表句子被提前中止。
+  - **靜默漏譯偵測（`_is_silent_passthrough`）**：專門對付「輸出長度不變、標點完整，但內容根本沒有翻譯」的隱形 Bug。使用簡體字元存活率演算法，對 batch 中的每個子段落獨立驗算——若譯文中超過 50% 的「必須轉換簡體字」仍原封不動，即判定為靜默漏譯並觸發重譯，避免壞的結果被快取永久固化。
+  
+  一旦觸發，系統將該段落物理切碎、塞入 `⚡` 分隔符強制切斷 NMT 注意力機制後，以單一請求一次性發送。這不僅完美繞過漏句 Bug，更免去了 HTTP 500 擋刷限流。
   - **效能實測對比**：針對十五本輕小說（約 4.2 萬個段落，共 250 萬翻譯字元）進行實測。相較於傳統重譯機制，新版演算法將**總耗時自 12 分 40 秒縮減至 8 分 58 秒（提速近 30%）**；HTTP 請求總數更是從 2302 次降至 **1891 次**（平均每次請求處理高達 22.3 個段落）。若清除本地快取再次執行，受惠於 Google 遠端 NMT 本身的快取命中，整體時間更能進一步**砍半至 4 分 41 秒**。期間遭遇的 70 次 NMT 嚴重漏句與幻覺，皆被閃電隔離完美捕捉修復，全程零資料流失。
 - 失敗自動以指數退讓無限重試，絕不產出夾雜簡體的半成品。
 
