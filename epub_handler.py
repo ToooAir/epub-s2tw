@@ -255,7 +255,6 @@ def _cliff_threshold(counts: dict[str, int], hard_floor: int) -> int:
     relative_threshold = int(max_val * 0.15)
     return max(relative_threshold, hard_floor)
 
-
 def scan_protected_entities(
     raw_docs: list[bytes],
     s2t_keys: frozenset[str],
@@ -266,9 +265,10 @@ def scan_protected_entities(
     """掃描全書，找出高頻且不需繁簡轉換的固定詞（如人名）。"""
     cjk = re.compile(r'^[\u4e00-\u9fff\u3400-\u4dbf]+$')
     counter = Counter()
+    all_texts: list[str] = []  # 用於左側語境檢查
     
     # 過濾常見語法助詞與代名詞，避免切碎句子結構
-    stop_chars = set("的了着在是不也就和与到以得真啊喔哎一我你他她它这那哪其个们些么")
+    stop_chars = set("的了着在是不也就和与到以得真啊嘆哎一我你他她它这那哪其个们些么")
 
     
     for raw in raw_docs:
@@ -287,6 +287,7 @@ def scan_protected_entities(
             text = tag.get_text()
             if not text.strip():
                 continue
+            all_texts.append(text)  # 收集所有文字內容
             
             for n in range(ng_range[0], ng_range[1] + 1):
                 for i in range(len(text) - n + 1):
@@ -305,10 +306,39 @@ def scan_protected_entities(
     candidates = {s: c for s, c in counter.items() if c >= min_freq}
     dynamic_threshold = _cliff_threshold(candidates, hard_floor=min_freq)
     
-    entities = {}
+    entities: dict[str, int] = {}
     for s_ng, count in candidates.items():
         if count >= dynamic_threshold:
             entities[s_ng] = count
+
+    # 左側語境過濾：若候選詞幾乎總是接在特定 s2t 字元後面，代表它是更長名詞的尾段，應移除
+    # 例：「藤小姐」幾乎總是接在「后」（s2t 字）後面 → 它是「后藤小姐」的尾段，不應独立保護
+    if all_texts and entities:
+        combined_text = "\n".join(all_texts)
+        to_remove: list[str] = []
+        for s_ng in entities:
+            ng_len = len(s_ng)
+            total_occurrences = 0
+            s2t_prefix_counts: Counter = Counter()
+            pos = 0
+            while True:
+                pos = combined_text.find(s_ng, pos)
+                if pos == -1:
+                    break
+                total_occurrences += 1
+                if pos > 0:
+                    prev_char = combined_text[pos - 1]
+                    if prev_char in s2t_keys:
+                        s2t_prefix_counts[prev_char] += 1
+                pos += ng_len
+            if total_occurrences > 0 and s2t_prefix_counts:
+                most_common_prefix_count = s2t_prefix_counts.most_common(1)[0][1]
+                # 若 ≥80% 的出現都接在同一個 s2t 字元後面 → 尾段詞，移除
+                if most_common_prefix_count / total_occurrences >= 0.80:
+                    to_remove.append(s_ng)
+        for s_ng in to_remove:
+            del entities[s_ng]
+
     return entities
 
 
