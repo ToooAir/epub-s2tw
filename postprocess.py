@@ -10,6 +10,7 @@ postprocess.py
 
 import json
 import lzma
+import re
 from pathlib import Path
 
 
@@ -272,7 +273,8 @@ class PostProcessor:
             if not matched:
                 out.append(text[i])
                 i += 1
-        return "".join(out)
+        result = "".join(out)
+        return re.sub(r'…+', '……', result)
 
     def clear_applied_log(self):
         self._applied.clear()

@@ -161,6 +161,24 @@ class Translator:
         if self.fallback_count > 0:
             print(f"🛡️  中途遭遇 {self.fallback_count} 次 NMT 漏句/幻覺，已透過碎紙機閃電隔離完美修復。")
 
+    # ── Bracket protection ─────────────────────────────────────────────
+
+    # epub_handler 佔用 \uE000/\uE001 作為 opaque sentinel，從 \uE010 起以避免衝突
+    _BRACKET_PROTECT = {"「": "", "」": "", "『": "", "』": ""}
+    _BRACKET_RESTORE = {v: k for k, v in _BRACKET_PROTECT.items()}
+
+    @staticmethod
+    def _protect_brackets(text: str) -> str:
+        for ch, ph in Translator._BRACKET_PROTECT.items():
+            text = text.replace(ch, ph)
+        return text
+
+    @staticmethod
+    def _restore_brackets(text: str) -> str:
+        for ph, ch in Translator._BRACKET_RESTORE.items():
+            text = text.replace(ph, ch)
+        return text
+
     # ── Free mode ──────────────────────────────────────────────────────
 
     FREE_CHUNK   = 1800  # 單次請求安全字元上限
@@ -281,6 +299,7 @@ class Translator:
 
     def _free_request(self, text: str) -> str:
         """直接打一次 translate_a/single，回傳翻譯結果。失敗無限重試。"""
+        text = self._protect_brackets(text)
         attempt = 0
         while True:
             attempt += 1
@@ -293,7 +312,7 @@ class Translator:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                return "".join(t[0] for t in data[0] if t[0])
+                return self._restore_brackets("".join(t[0] for t in data[0] if t[0]))
             except Exception as e:
                 self.total_http -= 1  # 失敗不計入
                 wait = min(2 ** attempt, 120)
@@ -368,9 +387,10 @@ class Translator:
         """呼叫 Google Cloud Translation API v2，每次最多 100 段。"""
         results = []
         url     = f"{self.BASE_URL}?key={self.api_key}"
-        for i in range(0, len(texts), 100):
+        protected = [self._protect_brackets(t) for t in texts]
+        for i in range(0, len(protected), 100):
             self.total_http += 1
-            batch = texts[i : i + 100]
+            batch = protected[i : i + 100]
             resp  = self._session.post(
                 url,
                 json={"q": batch, "source": self.source, "target": self.target, "format": fmt},
@@ -378,7 +398,8 @@ class Translator:
             )
             resp.raise_for_status()
             results.extend(
-                t["translatedText"] for t in resp.json()["data"]["translations"]
+                self._restore_brackets(t["translatedText"])
+                for t in resp.json()["data"]["translations"]
             )
             time.sleep(0.2)
         return results
