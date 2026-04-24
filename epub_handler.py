@@ -1072,10 +1072,12 @@ class EpubProcessor:
         if not self._text_pairs or not moe_words:
             return
 
-        # Fixed-char MOE words: every character is identical in simplified and traditional
+        # Fixed-char MOE words of length >= 4 (prefix >= 3 chars).
+        # 2-char words have 1-char prefixes that are far too broad and cause
+        # massive false positives (e.g. 但 matching every occurrence of 但).
         fixed_moe = [
             w for w in moe_words
-            if len(w) >= 2 and all(c not in s2t_keys for c in w)
+            if len(w) >= 4 and all(c not in s2t_keys for c in w)
         ]
         if not fixed_moe:
             return
@@ -1133,12 +1135,6 @@ class EpubProcessor:
         if not repairs:
             return
 
-        tqdm.write(f"  🔧 截斷詞修復：{len(repairs)} 個")
-        for fw, _, _ in repairs[:5]:
-            tqdm.write(
-                f"       {fw[:-1]} → {fw}  "
-                f"(真:{fw_true.get(fw,0)} 假:{fw_false.get(fw,0)})"
-            )
 
         # Build regex patterns with closure-safe replacers
         def _make_replacer(fw: str, prefix: str, missing: str,
