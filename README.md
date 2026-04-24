@@ -223,5 +223,5 @@ Google Cloud Translation Basic API：每 100 萬字元 **USD $20**。
 
 - 免費模式對超長段落會自動切塊，但極端情況仍可能觸發 rate limit（會自動重試）
 - 內文中的注音（ruby/rt）標籤不會被翻譯
-- 一致性修正目前不覆蓋 toc.ncx 與 nav.xhtml，目錄中的人名可能仍有不一致
+- 一致性修正不覆蓋 nav.xhtml（章節標題出現頻率為 1，不觸發統計修正）；toc.ncx 已覆蓋
 - 若 Google 回傳的 HTML 有 entity 雙重編碼問題，可在 `epub_handler.py` 中把 `fmt="html"` 改為 `fmt="text"`
