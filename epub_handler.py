@@ -548,6 +548,11 @@ class EpubProcessor:
         self._translate_ncx(translator, postprocessor)
         self._translate_toc(translator, postprocessor)
         self._translate_metadata(translator, postprocessor)
+        if postprocessor and getattr(postprocessor, "moe_words", None):
+            s2t_k = frozenset(postprocessor.s2t_map.keys())
+            self._source_guided_repair_pass(
+                docs, s2t_k, postprocessor.moe_words, report_path=report_path
+            )
         s2t = postprocessor.s2t_map if postprocessor else {}
         self._consistency_pass(docs, s2t_map=s2t, report_path=report_path)
 
@@ -1047,6 +1052,166 @@ class EpubProcessor:
                 tqdm.write(f"  📄 一致性報告已輸出：{os.path.basename(report_path)}")
             except Exception as e:
                 tqdm.write(f"  ⚠️  報告寫入失敗：{e}")
+
+    def _source_guided_repair_pass(
+        self,
+        docs,
+        s2t_keys: frozenset,
+        moe_words: frozenset,
+        report_path: str | None = None,
+    ):
+        """Source-guided repair for fixed-char MOE idioms truncated by Google NMT.
+
+        Fixed-char words (same in simplified/traditional) should survive translation
+        unchanged. When Google truncates the last character (e.g. 老神在在 → 老神在),
+        this pass detects the prefix in the target and restores the full word.
+
+        False-positive filter: if prefix + next_char is itself a MOE headword,
+        the target contains a legitimately different word — skip the repair.
+        """
+        if not self._text_pairs or not moe_words:
+            return
+
+        # Fixed-char MOE words: every character is identical in simplified and traditional
+        fixed_moe = [
+            w for w in moe_words
+            if len(w) >= 2 and all(c not in s2t_keys for c in w)
+        ]
+        if not fixed_moe:
+            return
+
+        # Pre-filter: only consider words that actually appear in some source paragraph
+        all_src = "\n".join(src for src, _ in self._text_pairs)
+        candidate_fw = [fw for fw in fixed_moe if fw in all_src]
+        if not candidate_fw:
+            return
+
+        # Collect every char that follows fw[:-1] in ALL source text (excluding fw[-1]).
+        # These are "other legitimate extensions" of the prefix — the repair should not
+        # overwrite them even if they don't appear in MOE.
+        fw_src_ext: dict[str, set] = {}
+        for fw in candidate_fw:
+            prefix, missing = fw[:-1], fw[-1]
+            ext: set[str] = set()
+            idx = all_src.find(prefix)
+            while idx != -1:
+                nxt = idx + len(prefix)
+                nc = all_src[nxt] if nxt < len(all_src) else ""
+                if nc and nc != missing:
+                    ext.add(nc)
+                idx = all_src.find(prefix, idx + 1)
+            fw_src_ext[fw] = ext
+
+        # Scan text pairs: count true truncations vs. false positives per word
+        fw_true: dict[str, int] = {}
+        fw_false: dict[str, int] = {}
+        for src, tgt in self._text_pairs:
+            for fw in candidate_fw:
+                if fw not in src:
+                    continue
+                if fw in tgt:
+                    continue  # correct in this paragraph
+                prefix = fw[:-1]
+                idx = tgt.find(prefix)
+                while idx != -1:
+                    nxt = idx + len(prefix)
+                    nc = tgt[nxt] if nxt < len(tgt) else ""
+                    if nc and (prefix + nc) in moe_words:
+                        fw_false[fw] = fw_false.get(fw, 0) + 1
+                    else:
+                        fw_true[fw] = fw_true.get(fw, 0) + 1
+                    idx = tgt.find(prefix, idx + 1)
+
+        # Keep words with confirmed truncations that outnumber false positives
+        repairs: list[tuple[str, str, str]] = []  # (full_word, prefix, missing_char)
+        for fw in candidate_fw:
+            tc = fw_true.get(fw, 0)
+            fc = fw_false.get(fw, 0)
+            if tc > 0 and tc >= fc:
+                repairs.append((fw, fw[:-1], fw[-1]))
+
+        if not repairs:
+            return
+
+        tqdm.write(f"  🔧 截斷詞修復：{len(repairs)} 個")
+        for fw, _, _ in repairs[:5]:
+            tqdm.write(
+                f"       {fw[:-1]} → {fw}  "
+                f"(真:{fw_true.get(fw,0)} 假:{fw_false.get(fw,0)})"
+            )
+
+        # Build regex patterns with closure-safe replacers
+        def _make_replacer(fw: str, prefix: str, missing: str,
+                           moe=moe_words, src_ext=fw_src_ext):
+            other_ext = src_ext.get(fw, frozenset())
+            def replacer(m: re.Match) -> str:
+                nc = m.group(1)
+                if nc == missing:
+                    return m.group(0)          # already the full word
+                if nc and (prefix + nc) in moe:
+                    return m.group(0)          # different valid MOE word
+                if nc in other_ext:
+                    return m.group(0)          # prefix has other legitimate use in source
+                return fw + nc                 # repair truncation
+            return replacer
+
+        compiled: list[tuple[str, re.Pattern, object]] = []
+        for fw, prefix, missing in repairs:
+            pat = re.compile(re.escape(prefix) + "(.?)", re.DOTALL)
+            compiled.append((prefix, pat, _make_replacer(fw, prefix, missing)))
+
+        HEAD_PAT = re.compile(
+            r'<head(?:\s[^>]*)?(?:/>|>.*?</head>)', re.DOTALL | re.IGNORECASE
+        )
+
+        for item in docs:
+            try:
+                content_bytes = item.get_content()
+                content_str = content_bytes.decode("utf-8", errors="ignore")
+                if not any(prefix in content_str for prefix, _, _ in compiled):
+                    continue
+
+                try:
+                    soup = BeautifulSoup(content_bytes, "lxml-xml")
+                except Exception:
+                    soup = BeautifulSoup(content_bytes, "html.parser")
+
+                changed = False
+                for text_node in soup.find_all(string=True):
+                    if text_node.parent and text_node.parent.name in SKIP_ANCESTOR:
+                        continue
+                    text = str(text_node)
+                    new_text = text
+                    for prefix, pat, repl in compiled:
+                        if prefix in new_text:
+                            new_text = pat.sub(repl, new_text)
+                    if new_text != text:
+                        text_node.replace_with(new_text)
+                        changed = True
+
+                if changed:
+                    result = str(soup)
+                    result = re.sub(r'\bviewbox\b', 'viewBox', result)
+                    orig_head = HEAD_PAT.search(content_str)
+                    if orig_head:
+                        result = HEAD_PAT.sub(orig_head.group(0), result, count=1)
+                    patched = result.encode("utf-8")
+                    item.set_content(patched)
+                    item.get_content = lambda b=patched, d=None: b
+            except Exception:
+                continue
+
+        if report_path:
+            try:
+                with open(report_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n\n=== 截斷詞修復 ({len(repairs)} 個) ===\n")
+                    for fw, _, _ in repairs:
+                        f.write(
+                            f"  {fw[:-1]} → {fw}  "
+                            f"(真:{fw_true.get(fw,0)} 假:{fw_false.get(fw,0)})\n"
+                        )
+            except Exception:
+                pass
 
     def save(self, output_path: str):
         epub.write_epub(output_path, self.book, {})
