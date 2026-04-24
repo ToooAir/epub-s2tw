@@ -1060,21 +1060,20 @@ class EpubProcessor:
         moe_words: frozenset,
         report_path: str | None = None,
     ):
-        """Source-guided repair for fixed-char MOE idioms truncated by Google NMT.
+        """以原文為基準，修復 Google NMT 截斷的固定字 MOE 詞頭。
 
-        Fixed-char words (same in simplified/traditional) should survive translation
-        unchanged. When Google truncates the last character (e.g. 老神在在 → 老神在),
-        this pass detects the prefix in the target and restores the full word.
+        固定字詞（簡繁相同）在翻譯後應原封不動保留。
+        當 Google 截斷最後一字（如 老神在在 → 老神在）時，
+        此程序會在譯文中偵測前綴，並還原完整詞形。
 
-        False-positive filter: if prefix + next_char is itself a MOE headword,
-        the target contains a legitimately different word — skip the repair.
+        假陽性過濾：若前綴 + 下一字本身是 MOE 詞頭（如 不在乎），
+        則視為合法的不同譯詞，跳過修復。
         """
         if not self._text_pairs or not moe_words:
             return
 
-        # Fixed-char MOE words of length >= 4 (prefix >= 3 chars).
-        # 2-char words have 1-char prefixes that are far too broad and cause
-        # massive false positives (e.g. 但 matching every occurrence of 但).
+        # 固定字 MOE 詞，且長度 >= 4（前綴 >= 3 字）。
+        # 2 字詞的前綴只有 1 字，範圍太廣，會產生大量誤觸（如 但 命中所有含「但」的位置）。
         fixed_moe = [
             w for w in moe_words
             if len(w) >= 4 and all(c not in s2t_keys for c in w)
@@ -1082,15 +1081,14 @@ class EpubProcessor:
         if not fixed_moe:
             return
 
-        # Pre-filter: only consider words that actually appear in some source paragraph
+        # 預篩：只保留實際出現在原文中的詞
         all_src = "\n".join(src for src, _ in self._text_pairs)
         candidate_fw = [fw for fw in fixed_moe if fw in all_src]
         if not candidate_fw:
             return
 
-        # Collect every char that follows fw[:-1] in ALL source text (excluding fw[-1]).
-        # These are "other legitimate extensions" of the prefix — the repair should not
-        # overwrite them even if they don't appear in MOE.
+        # 收集全書原文中接在 fw[:-1] 後的所有字元（排除 fw[-1] 本身）。
+        # 這些是前綴的「其他合法延伸」—— 即使不在 MOE 中，修復也不應覆蓋。
         fw_src_ext: dict[str, set] = {}
         for fw in candidate_fw:
             prefix, missing = fw[:-1], fw[-1]
@@ -1104,7 +1102,7 @@ class EpubProcessor:
                 idx = all_src.find(prefix, idx + 1)
             fw_src_ext[fw] = ext
 
-        # Scan text pairs: count true truncations vs. false positives per word
+        # 掃描文字對：統計每個詞的真截斷次數與假陽性次數
         fw_true: dict[str, int] = {}
         fw_false: dict[str, int] = {}
         for src, tgt in self._text_pairs:
@@ -1112,7 +1110,7 @@ class EpubProcessor:
                 if fw not in src:
                     continue
                 if fw in tgt:
-                    continue  # correct in this paragraph
+                    continue  # 本段翻譯正確，跳過
                 prefix = fw[:-1]
                 idx = tgt.find(prefix)
                 while idx != -1:
@@ -1124,8 +1122,8 @@ class EpubProcessor:
                         fw_true[fw] = fw_true.get(fw, 0) + 1
                     idx = tgt.find(prefix, idx + 1)
 
-        # Keep words with confirmed truncations that outnumber false positives
-        repairs: list[tuple[str, str, str]] = []  # (full_word, prefix, missing_char)
+        # 保留真截斷次數 > 0 且 >= 假陽性次數的詞
+        repairs: list[tuple[str, str, str]] = []  # (完整詞, 前綴, 遺失字)
         for fw in candidate_fw:
             tc = fw_true.get(fw, 0)
             fc = fw_false.get(fw, 0)
@@ -1135,20 +1133,19 @@ class EpubProcessor:
         if not repairs:
             return
 
-
-        # Build regex patterns with closure-safe replacers
+        # 為每個修復詞建立正規表達式與閉包 replacer
         def _make_replacer(fw: str, prefix: str, missing: str,
                            moe=moe_words, src_ext=fw_src_ext):
             other_ext = src_ext.get(fw, frozenset())
             def replacer(m: re.Match) -> str:
                 nc = m.group(1)
                 if nc == missing:
-                    return m.group(0)          # already the full word
+                    return m.group(0)          # 已是完整詞，不動
                 if nc and (prefix + nc) in moe:
-                    return m.group(0)          # different valid MOE word
+                    return m.group(0)          # 前綴+下一字是合法 MOE 詞，跳過
                 if nc in other_ext:
-                    return m.group(0)          # prefix has other legitimate use in source
-                return fw + nc                 # repair truncation
+                    return m.group(0)          # 前綴在原文有其他合法用途，跳過
+                return fw + nc                 # 截斷確認，還原完整詞
             return replacer
 
         compiled: list[tuple[str, re.Pattern, object]] = []
