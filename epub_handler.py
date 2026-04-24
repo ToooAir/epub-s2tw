@@ -1102,6 +1102,21 @@ class EpubProcessor:
                 idx = all_src.find(prefix, idx + 1)
             fw_src_ext[fw] = ext
 
+        # 收集原文中緊接在完整詞 fw 之後的字元集合。
+        # 用於區分「截斷」與「置換」：
+        #   截斷：prefix 後直接接 post_char（正常接字）→ 插入 missing
+        #   置換：prefix 後接了替代字，post_char 出現在更後面  → 丟掉替代字，補完整詞
+        fw_post_chars: dict[str, set] = {}
+        for src, tgt in self._text_pairs:
+            for fw in candidate_fw:
+                idx = src.find(fw)
+                while idx != -1:
+                    pc_pos = idx + len(fw)
+                    pc = src[pc_pos] if pc_pos < len(src) else ""
+                    if pc:
+                        fw_post_chars.setdefault(fw, set()).add(pc)
+                    idx = src.find(fw, idx + 1)
+
         # 掃描文字對：統計每個詞的真截斷次數與假陽性次數
         fw_true: dict[str, int] = {}
         fw_false: dict[str, int] = {}
@@ -1122,12 +1137,19 @@ class EpubProcessor:
                         fw_true[fw] = fw_true.get(fw, 0) + 1
                     idx = tgt.find(prefix, idx + 1)
 
-        # 保留真截斷次數 > 0 且 >= 假陽性次數的詞
+        # 保留真截斷次數達標且 >= 假陽性次數的詞。
+        # 疊詞（AABB 或末兩字相同，如 扭扭捏捏、老神在在）截斷後必然不合法，1 次即修復。
+        # 其他詞（如 露天咖啡座）可能是 Google 的合法翻譯簡化，需至少 2 次才視為系統性錯誤。
+        def _is_reduplication(w: str) -> bool:
+            return (len(w) >= 4 and w[-2] == w[-1]) or \
+                   (len(w) == 4 and w[0] == w[1] and w[2] == w[3])
+
         repairs: list[tuple[str, str, str]] = []  # (完整詞, 前綴, 遺失字)
         for fw in candidate_fw:
             tc = fw_true.get(fw, 0)
             fc = fw_false.get(fw, 0)
-            if tc > 0 and tc >= fc:
+            min_tc = 1 if _is_reduplication(fw) else 2
+            if tc >= min_tc and tc >= fc:
                 repairs.append((fw, fw[:-1], fw[-1]))
 
         if not repairs:
@@ -1135,8 +1157,10 @@ class EpubProcessor:
 
         # 為每個修復詞建立正規表達式與閉包 replacer
         def _make_replacer(fw: str, prefix: str, missing: str,
-                           moe=moe_words, src_ext=fw_src_ext):
-            other_ext = src_ext.get(fw, frozenset())
+                           moe=moe_words, src_ext=fw_src_ext,
+                           post_chars=fw_post_chars):
+            other_ext  = src_ext.get(fw, frozenset())
+            known_post = post_chars.get(fw, frozenset())
             def replacer(m: re.Match) -> str:
                 nc = m.group(1)
                 if nc == missing:
@@ -1145,7 +1169,9 @@ class EpubProcessor:
                     return m.group(0)          # 前綴+下一字是合法 MOE 詞，跳過
                 if nc in other_ext:
                     return m.group(0)          # 前綴在原文有其他合法用途，跳過
-                return fw + nc                 # 截斷確認，還原完整詞
+                if nc in known_post:
+                    return fw + nc             # 截斷：nc 是 fw 後的正常接字，插入 missing
+                return fw                      # 置換：nc 是替代字，丟掉 nc 補完整詞
             return replacer
 
         compiled: list[tuple[str, re.Pattern, object]] = []
