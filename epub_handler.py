@@ -1117,9 +1117,13 @@ class EpubProcessor:
                         fw_post_chars.setdefault(fw, set()).add(pc)
                     idx = src.find(fw, idx + 1)
 
-        # 掃描文字對：統計每個詞的真截斷次數與假陽性次數
-        fw_true: dict[str, int] = {}
-        fw_false: dict[str, int] = {}
+        # 掃描文字對：分別統計置換次數、截斷次數與假陽性次數。
+        # 置換（nc 不在 known_post）：明顯字形錯誤，1 次即可修復。
+        # 截斷（nc 在 known_post）：可能是合法翻譯簡化，需較高次數才修復。
+        # 假陽性（prefix+nc 是 MOE 詞頭）：合法不同譯詞，不修復。
+        fw_subst: dict[str, int] = {}   # 置換次數
+        fw_trunc: dict[str, int] = {}   # 截斷次數
+        fw_false: dict[str, int] = {}   # 假陽性次數
         for src, tgt in self._text_pairs:
             for fw in candidate_fw:
                 if fw not in src:
@@ -1127,29 +1131,36 @@ class EpubProcessor:
                 if fw in tgt:
                     continue  # 本段翻譯正確，跳過
                 prefix = fw[:-1]
+                known_post = fw_post_chars.get(fw, frozenset())
                 idx = tgt.find(prefix)
                 while idx != -1:
                     nxt = idx + len(prefix)
                     nc = tgt[nxt] if nxt < len(tgt) else ""
                     if nc and (prefix + nc) in moe_words:
                         fw_false[fw] = fw_false.get(fw, 0) + 1
+                    elif nc in known_post:
+                        fw_trunc[fw] = fw_trunc.get(fw, 0) + 1
                     else:
-                        fw_true[fw] = fw_true.get(fw, 0) + 1
+                        fw_subst[fw] = fw_subst.get(fw, 0) + 1
                     idx = tgt.find(prefix, idx + 1)
 
-        # 保留真截斷次數達標且 >= 假陽性次數的詞。
-        # 疊詞（AABB 或末兩字相同，如 扭扭捏捏、老神在在）截斷後必然不合法，1 次即修復。
-        # 其他詞（如 露天咖啡座）可能是 Google 的合法翻譯簡化，需至少 2 次才視為系統性錯誤。
+        # 門檻判斷：
+        # 置換（字被替換）：1 次即修；明顯字形錯誤，不可能是合法翻譯。
+        # 截斷（字被刪除）：疊詞 1 次，其他詞 2 次；刪字有時是合法簡化。
         def _is_reduplication(w: str) -> bool:
             return (len(w) >= 4 and w[-2] == w[-1]) or \
                    (len(w) == 4 and w[0] == w[1] and w[2] == w[3])
 
         repairs: list[tuple[str, str, str]] = []  # (完整詞, 前綴, 遺失字)
         for fw in candidate_fw:
-            tc = fw_true.get(fw, 0)
-            fc = fw_false.get(fw, 0)
-            min_tc = 1 if _is_reduplication(fw) else 2
-            if tc >= min_tc and tc >= fc:
+            sc  = fw_subst.get(fw, 0)
+            tc  = fw_trunc.get(fw, 0)
+            fc  = fw_false.get(fw, 0)
+            true_count = sc + tc
+            if true_count == 0 or true_count < fc:
+                continue
+            min_trunc = 1 if _is_reduplication(fw) else 2
+            if sc >= 1 or tc >= min_trunc:
                 repairs.append((fw, fw[:-1], fw[-1]))
 
         if not repairs:
@@ -1225,9 +1236,12 @@ class EpubProcessor:
                 with open(report_path, "a", encoding="utf-8") as f:
                     f.write(f"\n\n=== 截斷詞修復 ({len(repairs)} 個) ===\n")
                     for fw, _, _ in repairs:
+                        sc = fw_subst.get(fw, 0)
+                        tc = fw_trunc.get(fw, 0)
+                        fc = fw_false.get(fw, 0)
                         f.write(
                             f"  {fw[:-1]} → {fw}  "
-                            f"(真:{fw_true.get(fw,0)} 假:{fw_false.get(fw,0)})\n"
+                            f"(置換:{sc} 截斷:{tc} 假:{fc})\n"
                         )
             except Exception:
                 pass
