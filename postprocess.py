@@ -24,9 +24,10 @@ class PostProcessor:
         moedict_path: str = "dict-revised.json.xz",
     ):
         moe_headwords = self._load_moe_headwords(moedict_path)
-        self._s2t, self._corrections, self._manual_keys = self._build_corrections(
-            corrections_path, stcharacters_path, twvariants_path, moe_headwords
-        )
+        self._s2t, self._corrections, self._manual_keys, self.s2t_primary = \
+            self._build_corrections(
+                corrections_path, stcharacters_path, twvariants_path, moe_headwords
+            )
         self.moe_words = moe_headwords
         # 按首字分組，長詞優先：加速 single-pass 掃描
         # Layer 1（corrections.json）不受 bigram 保護；Layer 2/3 受保護
@@ -69,6 +70,8 @@ class PostProcessor:
         primary_to_alts: dict[str, list] = {}
         alt_to_primary: dict[str, str] = {}
         s2t: dict[str, set] = {}
+        s2t_primary: dict[str, str] = {}  # 簡體字 → 第一候選繁體字（用於 ground truth 比對）
+        t2s: dict[str, str] = {}          # 繁體字 → 簡體來源（首次出現優先）
         with open(stcharacters_path, encoding="utf-8") as f:
             for line in f:
                 if "\t" not in line:
@@ -77,7 +80,12 @@ class PostProcessor:
                 opts = t.strip().split()
                 if not opts:
                     continue
-                s2t[s.strip()] = set(opts)
+                simplified = s.strip()
+                s2t[simplified] = set(opts)
+                s2t_primary[simplified] = opts[0]
+                for tc in opts:
+                    if tc not in t2s:
+                        t2s[tc] = simplified
                 if len(opts) < 2:
                     continue
                 primary = opts[0]
@@ -89,8 +97,14 @@ class PostProcessor:
                             primary_to_alts[primary].append(alt)
 
         # MOE 詞頭生成層：以教育部字典為基礎，生成字形修正規則
-        # 對每個 MOE 詞頭（right）替換異體字，若替換結果（wrong）∉ MOE → 生成 wrong→right
-        # 保證：right 永遠是 MOE 認可的台灣標準詞；wrong∉MOE 由構造保證
+        # 對每個 MOE 詞頭（right）替換字形，若替換結果（wrong）∉ MOE → 生成 wrong→right
+        #
+        # 方向性過濾：只生成「NMT 自然輸出方向」的規則
+        # 條件：alt（wrong 中的替換字）必須是 headword 字的簡體來源的 s2t_primary 首選繁體
+        # 理由：NMT 對簡體字會輸出首選繁體（alt），若 headword 用了次選繁體（char），
+        #       規則方向才正確（wrong=alt形式 → right=headword 的 MOE 標準形式）。
+        # 反例被過濾：長發(MOE) → 長髮(wrong)，因為 髮 不是 发 的首選繁體(發才是)，
+        #             代表 NMT 不會自然輸出 長髮，規則方向錯誤。
         generated: dict[str, str] = {}
         for headword in moe_headwords:
             if len(headword) < 2:
@@ -104,6 +118,11 @@ class PostProcessor:
                 for alt in alts:
                     wrong = headword[:i] + alt + headword[i + 1:]
                     if wrong != headword and wrong not in moe_headwords:
+                        # 方向性過濾：alt 必須是 char 簡體來源的首選繁體
+                        simplified_src = t2s.get(char, char)
+                        nmt_natural = s2t_primary.get(simplified_src, char)
+                        if alt != nmt_natural:
+                            continue
                         generated[wrong] = headword
 
         # 載入既有測試型 corrections（優先），過濾過於激進的單字條目
@@ -139,7 +158,7 @@ class PostProcessor:
                 if new_val != val:
                     final_corrections[k] = new_val
 
-        return s2t, final_corrections, manual_keys
+        return s2t, final_corrections, manual_keys, s2t_primary
 
     @property
     def s2t_map(self) -> dict[str, set]:
@@ -201,6 +220,19 @@ class PostProcessor:
         """若 [start, end) 內部存在詞界（詞的起始位置），回傳 True（跨詞）。"""
         return any(b in self._ckip_boundaries for b in range(start + 1, end))
 
+    def _ckip_bigram_is_real(self, blocked_by: str, i: int, end: int) -> bool:
+        """判斷 bigram 保護是否真的成立（bigram 確實在同一個詞內）。
+        lookbehind 時：text[i-1] 和 text[i] 同詞 → bigram 真實 → 回傳 True（應跳過）
+        lookahead 時：text[end-1] 和 text[end] 同詞 → bigram 真實 → 回傳 True（應跳過）
+        若 i 本身是詞起點（text[i-1] 和 text[i] 不同詞），lookbehind bigram 是跨詞假警報。
+        """
+        if blocked_by.startswith("lookbehind"):
+            # i 是詞起點 → text[i-1] 和 text[i] 分屬兩詞 → bigram 是假警報
+            return i not in self._ckip_boundaries
+        else:  # lookahead
+            # end 是詞起點 → text[end-1] 和 text[end] 分屬兩詞 → bigram 是假警報
+            return end not in self._ckip_boundaries
+
     # ── 套用 ────────────────────────────────────────────────────────────
 
     def apply(self, text: str) -> str:
@@ -242,10 +274,12 @@ class PostProcessor:
                     elif end < n and (wrong[-1] + text[end]) in self._bigrams:
                         blocked_by = f"lookahead:{wrong[-1]+text[end]}"
                     if blocked_by:
-                        # 雙重確認：CKIP 未啟用 OR CKIP 也說跨界 → 才真的跳過
+                        # 雙重確認：CKIP 未啟用 OR CKIP 確認 bigram 真實存在於同一詞內 → 才真的跳過
+                        # lookbehind：i 不是詞起點 → text[i-1] 和 text[i] 同詞 → bigram 成立
+                        # lookahead ：end 不是詞起點 → text[end-1] 和 text[end] 同詞 → bigram 成立
                         ckip_confirms = (
                             self._ckip_ws is None or
-                            self._ckip_cross_boundary(i, end)
+                            self._ckip_bigram_is_real(blocked_by, i, end)
                         )
                         if ckip_confirms:
                             key = (wrong, right)

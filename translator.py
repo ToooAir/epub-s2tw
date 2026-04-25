@@ -177,6 +177,9 @@ class Translator:
     def _restore_brackets(text: str) -> str:
         for ph, ch in Translator._BRACKET_RESTORE.items():
             text = text.replace(ph, ch)
+        # Google 有時在閉引號前或中文標點後插空格，一併清除
+        text = re.sub(r' ([」』])', r'\1', text)
+        text = re.sub(r'([。？！，、；：]) (?=\S)', r'\1', text)
         return text
 
     # ── Free mode ──────────────────────────────────────────────────────

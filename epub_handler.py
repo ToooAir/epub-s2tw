@@ -17,7 +17,7 @@ import re
 import zipfile
 from collections import Counter, defaultdict
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 import ebooklib
 from ebooklib import epub
 from tqdm import tqdm
@@ -344,7 +344,7 @@ def scan_protected_entities(
 
 def _inject_entity_guards(tag, entities, pattern: re.Pattern):
     """將 tag 內的保護詞彙用 <span class="notranslate-name"> 包起來。"""
-    from bs4 import NavigableString
+
     import html
     text_nodes = [t for t in tag.find_all(string=True) if isinstance(t, NavigableString)]
     
@@ -550,9 +550,41 @@ class EpubProcessor:
         self._translate_metadata(translator, postprocessor)
         if postprocessor and getattr(postprocessor, "moe_words", None):
             s2t_k = frozenset(postprocessor.s2t_map.keys())
+            # 新 pass：字元級 diff 修復（單次截斷，不需跨書統計）
+            if getattr(postprocessor, "s2t_primary", None):
+                moe_bigrams = frozenset(
+                    w[i:i+2]
+                    for w in postprocessor.moe_words
+                    for i in range(len(w) - 1)
+                )
+                self._s2t_diff_repair_pass(
+                    docs, postprocessor.s2t_primary, moe_bigrams,
+                    s2t_full=postprocessor.s2t_map, report_path=report_path
+                )
             self._source_guided_repair_pass(
                 docs, s2t_k, postprocessor.moe_words, report_path=report_path
             )
+            # Repair pass 後的 postprocess cleanup：補正 repair 插入字元後產生的新異體字
+            # （如 repair 補 頭 後的 頭發染 → 頭髮染，需再跑一次 postprocess）
+            for item in docs:
+                try:
+                    raw = item.get_content()
+                    decoded = raw.decode("utf-8", errors="replace")
+                    is_xml = decoded.lstrip().startswith("<?xml")
+                    soup = BeautifulSoup(decoded, "lxml-xml" if is_xml else "html.parser")
+                    changed = False
+                    for node in soup.find_all(string=True):
+                        text = str(node)
+                        fixed = postprocessor.apply(text)
+                        if fixed != text:
+                            node.replace_with(NavigableString(fixed))
+                            changed = True
+                    if changed:
+                        patched = str(soup).encode("utf-8")
+                        item.set_content(patched)
+                        item.get_content = lambda b=patched, d=None: b
+                except Exception:
+                    continue
         s2t = postprocessor.s2t_map if postprocessor else {}
         self._consistency_pass(docs, s2t_map=s2t, report_path=report_path)
 
@@ -1052,6 +1084,194 @@ class EpubProcessor:
                 tqdm.write(f"  📄 一致性報告已輸出：{os.path.basename(report_path)}")
             except Exception as e:
                 tqdm.write(f"  ⚠️  報告寫入失敗：{e}")
+
+    # NMT 可合法省略的虛詞與語氣助詞，不觸發截斷修復
+    _DROPPABLE = frozenset(
+        "在了的地得也都就才還又已把被向給讓對於對从從往至及們么"
+        "啊喔嘛呢嘍噢哦之個些"  # 語氣助詞 + 易省略虛詞
+    )
+
+    def _s2t_diff_repair_pass(
+        self,
+        docs,
+        s2t_primary: dict,
+        moe_bigrams: frozenset,
+        s2t_full: dict | None = None,
+        report_path: str | None = None,
+    ):
+        """字元級 diff 修復：以 s2t(src) 為 ground truth，偵測並修復 NMT 單字截斷。
+
+        處理兩種 opcode：
+          delete  (1 char) → 缺字插回
+          replace (2→1)    → s2t_primary 歧義造成的「換字+缺字」（如 頭發→髮，實為頭髮）
+
+        Guard 設計（通過任一即觸發修復）：
+          A. 缺字+鄰字在 MOE bigram 中
+          B. 缺字在原文 bigram 中 AND 缺字不是語法虛詞
+        """
+        import difflib
+
+        if not self._text_pairs:
+            return
+
+        repairs: list[tuple[str, str]] = []
+        repaired_count = 0
+        skipped_count  = 0
+
+        def _try_repair(missing: str, left_e: str, right_e: str, j1: int, nmt: str,
+                        seg_src_bigrams: frozenset):
+            """Guard + 上下文替換 key 生成。通過則回傳 (wrong_ctx, right_ctx)，否則 None。"""
+            # Guard A：MOE bigram
+            in_moe = (left_e + missing) in moe_bigrams or (missing + right_e) in moe_bigrams
+            # Guard B：本段原文 bigram 且非虛詞（per-segment，防止跨段污染）
+            in_src = (
+                missing not in self._DROPPABLE
+                and (
+                    (left_e + missing) in seg_src_bigrams
+                    or (missing + right_e) in seg_src_bigrams
+                )
+            )
+            if not in_moe and not in_src:
+                return None
+
+            # Guard C：兩側鄰字仍在 NMT（確認截斷而非整塊替換）
+            if left_e and left_e not in nmt:
+                return None
+            if right_e and right_e not in nmt:
+                return None
+
+            ctx_l     = nmt[max(0, j1 - 2):j1]
+            ctx_r     = nmt[j1:j1 + 2]
+            wrong_ctx = ctx_l + ctx_r
+            right_ctx = ctx_l + missing + ctx_r
+            if not wrong_ctx or wrong_ctx == right_ctx:
+                return None
+            return wrong_ctx, right_ctx
+
+        for src, nmt in self._text_pairs:
+            expected = "".join(s2t_primary.get(c, c) for c in src)
+            if expected == nmt:
+                continue
+
+            # 本段原文 bigram（轉為繁體後），防止跨段污染
+            seg_src_bigrams: frozenset[str] = frozenset(
+                (s2t_primary.get(src[i], src[i]) + s2t_primary.get(src[i + 1], src[i + 1]))
+                for i in range(len(src) - 1)
+            )
+
+            matcher = difflib.SequenceMatcher(None, expected, nmt, autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+
+                # ── Case 1：純 delete，單字缺失 ──
+                if tag == "delete" and i2 - i1 == 1:
+                    missing = expected[i1]
+                    left_e  = expected[i1 - 1] if i1 > 0 else ""
+                    right_e = expected[i2]     if i2 < len(expected) else ""
+                    result  = _try_repair(missing, left_e, right_e, j1, nmt, seg_src_bigrams)
+                    if result:
+                        repairs.append(result)
+                        repaired_count += 1
+                    else:
+                        skipped_count += 1
+
+                # ── Case 2：replace 2→1（s2t_primary 歧義字造成的複合截斷）──
+                # expected[i1:i2] 是 2 字，nmt[j1:j2] 是 1 字
+                # 解讀為：expected[i1] 被截掉，expected[i1+1] 被 NMT 以不同字形保留
+                elif tag == "replace" and i2 - i1 == 2 and j2 - j1 == 1:
+                    # 額外 guard：NMT 保留字必須是對應來源字的合法 s2t 轉換
+                    # 確保是「截斷+異體字」而非「整塊詞彙替換」（如 俄羅斯→俄國）
+                    nmt_char   = nmt[j1] if j1 < len(nmt) else ""
+                    src_char_r = src[i1 + 1] if i1 + 1 < len(src) else ""
+                    if s2t_full and src_char_r in s2t_full:
+                        # 歧義字：NMT 必須使用合法繁體選項之一
+                        if nmt_char not in s2t_full[src_char_r]:
+                            skipped_count += 1
+                            continue
+                    else:
+                        # 非歧義字：簡繁相同，NMT 必須原樣保留（不同字 = 整塊替換）
+                        if nmt_char != src_char_r:
+                            skipped_count += 1
+                            continue
+
+                    missing   = expected[i1]
+                    left_e    = expected[i1 - 1] if i1 > 0 else ""
+                    right_e   = expected[i2]     if i2 < len(expected) else ""
+                    nmt_right = nmt_char
+                    result    = _try_repair(missing, left_e, nmt_right, j1, nmt, seg_src_bigrams)
+                    if result:
+                        repairs.append(result)
+                        repaired_count += 1
+                    else:
+                        skipped_count += 1
+
+        if not repairs:
+            return
+
+        seen: dict[str, str] = {}
+        for w, r in repairs:
+            if w not in seen:
+                seen[w] = r
+
+        # 全域衝突過濾：若 wrong 在任何 NMT 段落的「本就正確」位置出現
+        # （expected 同位也是 wrong），代表該字串合法，不可全域替換
+        safe: dict[str, str] = {}
+        for wrong, right in seen.items():
+            wlen = len(wrong)
+            conflict = False
+            for src2, nmt2 in self._text_pairs:
+                if wrong not in nmt2:
+                    continue
+                exp2 = "".join(s2t_primary.get(c, c) for c in src2)
+                pos = 0
+                while True:
+                    pos = nmt2.find(wrong, pos)
+                    if pos == -1:
+                        break
+                    if exp2[pos:pos + wlen] == wrong:
+                        conflict = True
+                        break
+                    pos += 1
+                if conflict:
+                    break
+            if not conflict:
+                safe[wrong] = right
+        seen = safe
+
+        for item in docs:
+            try:
+                raw     = item.get_content()
+                decoded = raw.decode("utf-8", errors="replace")
+                is_xml  = decoded.lstrip().startswith("<?xml")
+                soup    = BeautifulSoup(decoded, "lxml-xml" if is_xml else "html.parser")
+            except Exception:
+                continue
+
+            changed = False
+            for node in soup.find_all(string=True):
+                text = str(node)
+                for wrong, right in seen.items():
+                    if wrong in text:
+                        text = text.replace(wrong, right)
+                        changed = True
+                if changed:
+                    node.replace_with(NavigableString(text))
+                    changed = False
+
+            if any(w in item.get_content().decode("utf-8", errors="replace") for w in seen):
+                patched = str(soup).encode("utf-8")
+                item.set_content(patched)
+                item.get_content = lambda b=patched, d=None: b
+
+        if report_path:
+            try:
+                with open(report_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"\n=== 字元級截斷修復 ({repaired_count} 個，跳過 {skipped_count} 個) ===\n"
+                    )
+                    for w, r in seen.items():
+                        f.write(f"  {w!r} → {r!r}\n")
+            except Exception:
+                pass
 
     def _source_guided_repair_pass(
         self,
