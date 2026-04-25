@@ -1,9 +1,12 @@
 # epub-s2tw
 
 將簡體中文的 EPUB 翻譯成適合自己「舒服閱讀」的繁體中文（專為閱讀簡中電子書的台灣讀者打造）。
-本專案不只是一個單純的 Google 翻譯腳本，而是一套完整的「在地化管線（Localization Pipeline）」。它除了使用機翻解決語意問題外，更整合了 OpenCC 官方台灣異體字標準、NMT 幻覺降級機制與全書全域一致性檢查，致力於產出如同台版實體書般自然、順暢且沒有機翻怪味的閱讀體驗。
+本專案是一套完整的「在地化管線（Localization Pipeline）」，支援兩種翻譯引擎：
 
-> **免責聲明**：免費模式使用 Google 未公開的非官方端點，可能隨時失效或違反服務條款，請自行評估風險。
+- **繁化姬**（推薦）：以台灣標準詞庫進行確定性字詞轉換，無 NMT 幻覺、無需 API Key，搭配全書一致性修正使用。
+- **Google NMT**：神經機器翻譯，具備語意理解能力，適用於需要跨語意轉換的特殊場景。
+
+> **免責聲明**：Google NMT 免費模式使用 Google 未公開的非官方端點，可能隨時失效或違反服務條款，請自行評估風險。
 
 ## 為什麼不用純文字轉換 (OpenCC)？
 
@@ -49,16 +52,17 @@ EPUB 拆解→翻譯→重組的骨架，社群已有 [bilingual_book_maker](htt
 
 ```
 epub-s2tw/
-├── translate_epub.py     # CLI 入口
-├── epub_handler.py       # EPUB 讀取、文字抽取、翻譯替換、儲存
-├── translator.py         # Google Translate 包裝層（快取、批次、並行、兩種模式）
-├── postprocess.py        # 後處理層：修正 Google 的繁體歧義字與已知翻譯錯誤
-├── dict-revised.json.xz  # 教育部國語辭典（162,887 詞頭），後處理規則生成來源
-├── STCharacters.txt      # OpenCC 單字對照表（簡→繁，含多選項）
-├── TWVariants.txt        # 台灣異體字標準化對照表
-├── corrections.json      # 手動維護的已知修正字典（輕小說常見錯誤補丁）
-├── STPhrases.txt         # （已棄用，可刪除）
-├── build_corrections.py  # （已棄用）曾用於自動建立 corrections.json
+├── translate_epub.py        # CLI 入口
+├── epub_handler.py          # EPUB 讀取、文字抽取、翻譯替換、儲存
+├── translator.py            # Google Translate 包裝層（快取、批次、並行、兩種模式）
+├── zhconvert_translator.py  # 繁化姬包裝層（zhconvert.org），與 translator.py 介面相容
+├── postprocess.py           # 後處理層：修正 Google 的繁體歧義字與已知翻譯錯誤
+├── dict-revised.json.xz     # 教育部國語辭典（162,887 詞頭），後處理規則生成來源
+├── STCharacters.txt         # OpenCC 單字對照表（簡→繁，含多選項）
+├── TWVariants.txt           # 台灣異體字標準化對照表
+├── corrections.json         # 手動維護的已知修正字典（輕小說常見錯誤補丁）
+├── STPhrases.txt            # （已棄用，可刪除）
+├── build_corrections.py     # （已棄用）曾用於自動建立 corrections.json
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -78,20 +82,29 @@ cp .env.example .env
 
 ## 用法
 
-### 免費模式（不需 API Key）
+### 繁化姬模式（推薦，不需 API Key）
 
 ```bash
 # 單檔
-python translate_epub.py 小说.epub --free
+python translate_epub.py 小说.epub --zhconvert
 
 # 多檔（shell glob）
-python translate_epub.py ./*.epub --free
+python translate_epub.py ./*.epub --zhconvert
 
-# 遞迴掃描整個資料夾（自動排除 output 目錄）
+# 遞迴掃描整個資料夾
+python translate_epub.py -d ./books --zhconvert -o ./output -v
+```
+
+繁化姬以台灣標準詞庫進行字詞轉換，涵蓋國家教育研究院、教育部國語辭典、萌典等多套字典，轉換準確率高且無 NMT 幻覺問題，不需申請任何 API Key。
+
+### Google NMT 免費模式
+
+```bash
+python translate_epub.py 小说.epub --free
 python translate_epub.py -d ./books --free
 ```
 
-### API 模式（Google Cloud Translation v2）
+### Google NMT API 模式（Google Cloud Translation v2）
 
 ```bash
 python translate_epub.py -d ./books --api-key YOUR_KEY
@@ -103,35 +116,33 @@ python translate_epub.py -d ./books
 
 | 選項 | 說明 |
 |------|------|
+| `--zhconvert` | 使用繁化姬 API（zhconvert.org），無需 API Key（推薦）|
+| `--free` | 使用免費 Google 翻譯 |
+| `-k KEY` | 直接傳入 Google API Key |
 | `-d DIR` | 遞迴掃描資料夾內所有 .epub |
 | `-o DIR` | 指定輸出資料夾（預設 `./output`）|
-| `--free` | 使用免費 Google 翻譯 |
-| `-k KEY` | 直接傳入 API Key |
 | `--no-rename` | 不把輸出檔名轉為繁體 |
-| `--no-protect-entities` | 停用譯前高頻人名實體保護機制（預設為啟用） |
-| `--log-consistency` | 輸出一致性修正報告 (`_consistency.txt`)，同時包含譯前實體保護的詞彙清單與出現次數 |
+| `--no-protect-entities` | 停用譯前高頻人名實體保護機制（預設為啟用）|
+| `--log-consistency` | 輸出一致性修正報告 (`_consistency.txt`)|
 | `--ckip` | 啟用 CKIP albert-tiny 雙重詞界確認（需安裝 `ckip-transformers`）|
 | `-v` | 顯示每個 XHTML 的處理進度 |
 | `--dry-run` | 只列出會處理的檔案，不實際翻譯 |
-| `--clear-cache` | 清除全域快取 `.translate_cache.json` |
+| `--clear-cache` | 清除全域快取 `.translate_cache.json`（僅 Google NMT 模式使用）|
 
 ### 完整範例
 
 ```bash
-# 預覽會處理哪些檔案(books)（確認不含 output）
+# 預覽會處理哪些檔案（確認不含 output）
 python translate_epub.py -d ./books --dry-run
 
-# 免費版翻譯整個資料夾(books)到輸出資料夾(output)，顯示詳細進度
-python translate_epub.py -d ./books --free -v -o ./output
+# 繁化姬翻譯整個資料夾，顯示詳細進度
+python translate_epub.py -d ./books --zhconvert -v -o ./output
 
-# 檢查輸出檔案一致性(books -> output)
-python translate_epub.py -d ./books --free -o ./output  --log-consistency
+# Google 免費版，含一致性修正報告
+python translate_epub.py -d ./books --free -o ./output --log-consistency
 
-# 檢查輸出檔案一致性(books -> output)（使用 CKIP）
-python translate_epub.py -d ./books --free -o ./output  --log-consistency --ckip
-
-# 檢查輸出檔案一致性(books -> output)（使用 CKIP）並清除快取
-python translate_epub.py -d ./books --free -o ./output  --log-consistency --ckip --clear-cache
+# Google 免費版 + CKIP 雙重詞界確認
+python translate_epub.py -d ./books --free -o ./output --log-consistency --ckip
 ```
 
 ## 後處理層
@@ -225,6 +236,47 @@ Google NMT 對「簡繁相同的固定字詞」（如成語 `老神在在`、疊
 翻譯結果儲存在 `.translate_cache.json`。同一段文字只會送 API 一次，重跑或中斷後繼續都能省下費用與時間。批次處理多本書時，跨書的重複段落（角色名、口頭禪等）同樣只翻一次。
 
 ## 翻譯引擎
+
+### 引擎選擇指引
+
+本專案最初以 Google NMT 為核心，圍繞它建立了大量的幻覺偵測、截斷修復與後處理防護。隨著使用規模擴大，逐漸發現 Google NMT 在 zh-CN→zh-TW 這個特定任務上是整個管線品質的根本天花板——幻覺、字詞截斷、系統性異體字輸出等問題，需要越來越複雜的 repair pass 才能彌補，而這些 repair pass 對繁化姬的輸出觸發率接近零。
+
+實測驗證後決定：**對於 zh-CN→zh-TW 的日常翻譯，繁化姬是更適合的預設選擇**。理由如下：
+
+| | 繁化姬（`--zhconvert`） | Google NMT（`--free` / `--api-key`） |
+|---|---|---|
+| **轉換品質** | 確定性，相同輸入永遠相同輸出 | 語意對齊，但有系統性幻覺與截斷風險 |
+| **誤傷率** | 極低（詞庫精確，無 OpenCC 的過貪婪匹配） | 需 NMT repair pass 持續修補 |
+| **速度** | 約 40 萬字 / 20 秒 | 受批次大小與 rate limit 限制，同規模約 5～15 分鐘 |
+| **API Key** | 不需要 | 免費模式可用，穩定性較低 |
+| **後處理效果** | postprocess.py 三層規則幾乎不觸發（非必要） | 後處理對修正 NMT 錯誤有顯著效果 |
+
+**適合考慮 Google NMT 的情境（理論上少見）：**
+- 原文雖標記為簡體中文，但實際包含大量非中文語境（如中英夾雜的技術文件、日文直譯的學術腳注），需要語意層翻譯而非字詞轉換
+- zhconvert.org 服務中斷，需要緊急備援
+- 原著刻意使用某個「只存在於簡體」的詞彙作為文字梗，希望保留 NMT 的語意判斷
+
+對於一般輕小說、網路小說的閱讀需求，繁化姬在準確度、速度與穩定性上均優於 Google NMT。
+
+---
+
+### 繁化姬（`--zhconvert`）
+
+使用 [zhconvert.org](https://zhconvert.org) 公開 API（`converter=Taiwan`），以台灣標準詞庫對每個字詞進行確定性轉換。
+
+- 字典堆疊：goo辞書、漢字ペディア、國家教育研究院、教育部重編國語辭典修訂本、萌典、汉典、粵語審音配詞字庫
+- 字詞轉換具確定性，相同輸入永遠產生相同輸出，無幻覺風險
+- 最大批次 8000 字，整本書（約 40 萬字）約 30 秒內完成
+- HTML 標籤安全：繁化姬只轉換漢字，`<em>`、`<strong>` 等標籤原封不動
+- 啟用此模式時，NMT 專用的截斷修復 pass（`_s2t_diff_repair_pass`、`_source_guided_repair_pass`）會自動跳過
+
+> 相較 OpenCC，繁化姬不會將「的士」誤轉為「計程車」，也不會在詞語中途截斷字詞，誤傷率遠低。
+
+**注意事項（繁化姬服務條款）：**
+- 本專案使用了[繁化姬](https://zhconvert.org)的服務（https://zhconvert.org）
+- 繁化姬不保證所有轉換均正確，轉換結果僅供參考；正式文件請在轉換後親自校閱
+
+### Google NMT（`--free` / `--api-key`）
 
 免費模式使用 `translate.googleapis.com/translate_a/single` 非官方端點：
 

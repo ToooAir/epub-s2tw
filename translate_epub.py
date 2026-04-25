@@ -35,6 +35,7 @@ from tqdm import tqdm
 from epub_handler import EpubProcessor
 from postprocess import PostProcessor
 from translator import Translator
+from zhconvert_translator import ZhConvertTranslator
 
 load_dotenv()
 
@@ -58,7 +59,7 @@ def to_trad_filename(stem: str) -> str:
 def process_file(
     input_path: Path,
     output_dir: Path,
-    translator: Translator,
+    translator,
     postprocessor: PostProcessor,
     rename: bool = True,
     verbose: bool = False,
@@ -127,6 +128,8 @@ def main():
                         help="啟用 ckip-transformers albert-tiny 雙重詞界確認（降低 bigram 誤傷）")
     parser.add_argument("--no-protect-entities", action="store_true",
                         help="停用譯前高頻人名實體保護機制（預設為啟用）")
+    parser.add_argument("--zhconvert", action="store_true",
+                        help="使用繁化姬 API（zhconvert.org）取代 Google NMT，無需 API Key")
     args = parser.parse_args()
 
     if args.clear_cache:
@@ -180,19 +183,23 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    use_free   = args.free or not args.api_key
-    translator = Translator(
-        api_key = None if use_free else args.api_key,
-        source  = "zh-CN",
-        target  = "zh-TW",
-    )
+    if args.zhconvert:
+        translator = ZhConvertTranslator()
+    else:
+        use_free   = args.free or not args.api_key
+        translator = Translator(
+            api_key = None if use_free else args.api_key,
+            source  = "zh-CN",
+            target  = "zh-TW",
+        )
     postprocessor = PostProcessor()
     if args.ckip:
         postprocessor.enable_ckip()
         print("✓ CKIP albert-tiny 斷詞器已啟用")
     print(f"✓ 後處理器載入：{postprocessor.stats()}")
-    # 注入 s2t_keys，讓碎紙機具備通用靜默漏譯偵測能力
-    translator._s2t_keys = frozenset(postprocessor.s2t_map.keys())
+    if not args.zhconvert:
+        # 注入 s2t_keys，讓 Translator 具備靜默漏譯偵測能力
+        translator._s2t_keys = frozenset(postprocessor.s2t_map.keys())
 
     success = fail = 0
     with tqdm(epub_files, unit="本", dynamic_ncols=True) as book_bar:

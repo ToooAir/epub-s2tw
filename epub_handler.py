@@ -548,7 +548,8 @@ class EpubProcessor:
         self._translate_ncx(translator, postprocessor)
         self._translate_toc(translator, postprocessor)
         self._translate_metadata(translator, postprocessor)
-        if postprocessor and getattr(postprocessor, "moe_words", None):
+        if postprocessor and getattr(postprocessor, "moe_words", None) \
+                and not getattr(translator, "skip_nmt_repair", False):
             s2t_k = frozenset(postprocessor.s2t_map.keys())
             # 新 pass：字元級 diff 修復（單次截斷，不需跨書統計）
             if getattr(postprocessor, "s2t_primary", None):
