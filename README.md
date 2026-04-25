@@ -182,8 +182,8 @@ Google NMT 對「簡繁相同的固定字詞」（如成語 `老神在在`、疊
 - `corrections.json`（Layer 1）為人工驗證的已知錯誤，**不受 bigram 邊界保護限制**，無條件套用。
 - MOE 生成規則（Layer 2）才受 bigram 保護，避免誤傷合法詞彙。
 
-**（可選）CKIP 雙重詞界確認：** *(Google NMT 模式下較有意義)*
-啟用 `--ckip` 後，Layer 2 的 bigram 攔截會加入第二道驗證——以 `ckip-transformers albert-tiny` 斷詞器確認是否真的跨詞界，兩者皆同意才跳過，任一放行則套用修正，大幅降低 bigram 誤傷率。繁化姬模式下 Layer 2 觸發率接近零，啟用效果有限。
+**（可選）CKIP 雙重詞界確認：**
+啟用 `--ckip` 後，Layer 2 的 bigram 攔截會加入第二道驗證——以 `ckip-transformers albert-tiny` 斷詞器確認是否真的跨詞界，兩者皆同意才跳過，任一放行則套用修正，大幅降低 bigram 誤傷率。繁化姬模式下 Layer 2 仍偶有觸發（例：`地只→地祇`，`祇` 為 `只` 的文言繁體形式），搭配 `--ckip` 可確保這類邊界案例被正確處理而非被 bigram 誤擋。
 
 **Bigram 攔截 Log（`--log-consistency`）：**
 報告末尾會附上「Bigram 攔截紀錄」，列出匹配成功但被攔截的規則與上下文，供人工確認是否需補入 `corrections.json`。
