@@ -593,7 +593,7 @@ class EpubProcessor:
             try:
                 with open(report_path, "a", encoding="utf-8") as f:
                     f.write(f"\n\n=== 譯前命名實體保護 ({len(entities)} 詞) ===\n\n")
-                    f.write("  ↑ 以下高頻固定詞在送交 Google NMT 前被標籤隔離，成功避免了因斷詞錯誤導致的幻覺\n\n")
+                    f.write("  ↑ 以下高頻固定詞在送交翻譯引擎前被標籤隔離，成功避免了因斷詞錯誤導致的幻覺\n\n")
                     sorted_entities = sorted(entities.keys(), key=lambda k: (-entities[k], len(k)))
                     for idx, e in enumerate(sorted_entities, 1):
                         f.write(f"[{idx:03d}] {e}  (出現 {entities[e]} 次)\n")
