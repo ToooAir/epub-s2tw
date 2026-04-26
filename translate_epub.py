@@ -196,7 +196,12 @@ def main():
     if args.ckip:
         postprocessor.enable_ckip()
         print("✓ CKIP albert-tiny 斷詞器已啟用")
+        if args.zhconvert:
+            postprocessor.strict_ckip = True
+            print("✓ strict_ckip 已啟用（Design 3b：繁化姬+CKIP 詞界守門）")
     print(f"✓ 後處理器載入：{postprocessor.stats()}")
+    if postprocessor._seam_scores:
+        postprocessor.write_seam_report(str(output_dir / "seam_report.md"))
     if not args.zhconvert:
         # 注入 s2t_keys，讓 Translator 具備靜默漏譯偵測能力
         translator._s2t_keys = frozenset(postprocessor.s2t_map.keys())

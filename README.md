@@ -56,6 +56,7 @@ epub-s2tw/
 ├── translator.py            # Google Translate 包裝層（快取、批次、並行、兩種模式）
 ├── zhconvert_translator.py  # 繁化姬包裝層（zhconvert.org），與 translator.py 介面相容
 ├── postprocess.py           # 後處理層：修正 Google 的繁體歧義字與已知翻譯錯誤
+├── analyze_rules.py         # 後處理規則品質分析：解析 consistency logs、計算接縫評分、輸出 rule_analysis.md
 ├── dict-revised.json.xz     # 教育部國語辭典（162,887 詞頭），後處理規則生成來源
 ├── STCharacters.txt         # OpenCC 單字對照表（簡→繁，含多選項）
 ├── TWVariants.txt           # 台灣異體字標準化對照表
@@ -142,6 +143,9 @@ python translate_epub.py -d ./books --free -o ./output --log-consistency
 
 # Google 免費版 + CKIP 雙重詞界確認
 python translate_epub.py -d ./books --free -o ./output --log-consistency --ckip
+
+# 繁化姬 + CKIP strict 守門（推薦組合，最低誤傷率）
+python translate_epub.py -d ./books --zhconvert -o ./output --log-consistency --ckip
 ```
 
 ## 後處理層
@@ -182,8 +186,17 @@ Google NMT 對「簡繁相同的固定字詞」（如成語 `老神在在`、疊
 - `corrections.json`（Layer 1）為人工驗證的已知錯誤，**不受 bigram 邊界保護限制**，無條件套用。
 - MOE 生成規則（Layer 2）才受 bigram 保護，避免誤傷合法詞彙。
 
-**（可選）CKIP 雙重詞界確認：**
-啟用 `--ckip` 後，Layer 2 的 bigram 攔截會加入第二道驗證——以 `ckip-transformers albert-tiny` 斷詞器確認是否真的跨詞界，兩者皆同意才跳過，任一放行則套用修正，大幅降低 bigram 誤傷率。繁化姬模式下 Layer 2 仍偶有觸發（例：`地只→地祇`，`祇` 為 `只` 的文言繁體形式），搭配 `--ckip` 可確保這類邊界案例被正確處理而非被 bigram 誤擋。
+**（可選）CKIP 雙重詞界確認（Design 3a）：**
+啟用 `--ckip` 後，Layer 2 的 bigram 攔截加入第二道 `ckip-transformers albert-tiny` 斷詞驗證。CKIP **覆蓋** bigram 攔截須同時滿足雙條件：① bigram 判定為跨詞邊界（非真詞）；② 匹配範圍在 CKIP 切詞邊界上完整對齊（含範圍內無內部跨界）。任一條件不符則維持 bigram 攔截（log 標記 `[3a-bigram-wins]`），有效攔截 `被發→被髮`、`地只→地祇` 等跨詞誤切。
+
+**繁化姬 + CKIP strict 守門（Design 3b）：**
+`--zhconvert --ckip` 組合時，額外啟用 `strict_ckip` 守門：即使 bigram 未觸發，若 Layer 2 規則的匹配範圍未能完整對齊 CKIP 詞界，同樣攔截（log 標記 `[3b-align-fail]`）。此守門專為繁化姬設計，NMT 模式下不啟用。
+
+**layer2_blocklist（語義豁免清單）：**
+`corrections.json` 的 `layer2_blocklist` 欄位可列出特定 key，在 Layer 2 規則生成時直接排除，阻止語義同形詞（如 `天後→天后`，「天後」語境多指「天上之後」）或方向倒退規則進入管線。Layer 1 手動 `corrections` 條目不受影響。
+
+**Layer 2 接縫風險評分—logging-only（Direction 1）：**
+`_build_corrections()` 生成 Layer 2 規則時同步計算每條規則的接縫評分（`gen_seam = suffix_freq[wrong[-2]] × prefix_freq[wrong[-1]]`），記錄至 `seam_report.md`。分數越高代表 wrong 的末二字越可能成為跨詞接縫（誤觸風險高）。目前為 logging-only 模式（`layer2_seam_threshold: 0`），可透過 `analyze_rules.py` 校準 θ 後啟用過濾。
 
 **Bigram 攔截 Log（`--log-consistency`）：**
 報告末尾會附上「Bigram 攔截紀錄」，列出匹配成功但被攔截的規則與上下文，供人工確認是否需補入 `corrections.json`。
@@ -201,6 +214,19 @@ Google NMT 對「簡繁相同的固定字詞」（如成語 `老神在在`、疊
 ```
 
 規則格式：`"wrong": "right"`，其中 `wrong` 為引擎實際輸出的錯誤形式，`right` 為台灣標準。key 長度須 ≥ 2 字元。
+
+`corrections.json` 另支援兩個頂層欄位控制 Layer 2 行為：
+
+```json
+{
+  "corrections": { ... },
+  "layer2_blocklist": ["天後", "僵屍"],
+  "layer2_seam_threshold": 0
+}
+```
+
+- `layer2_blocklist`：列於此的 key 在 Layer 2 規則生成時直接排除（不影響 Layer 1 `corrections`）
+- `layer2_seam_threshold`：接縫評分過濾閾值，`0` 為 logging-only，>0 時過濾高風險短規則（需先透過 `analyze_rules.py` 校準）
 
 ## 一致性修正
 

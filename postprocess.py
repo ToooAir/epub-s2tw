@@ -11,6 +11,7 @@ postprocess.py
 import json
 import lzma
 import re
+from collections import Counter
 from pathlib import Path
 
 
@@ -49,6 +50,7 @@ class PostProcessor:
         # CKIP 斷詞器（可選）：lazy init，呼叫 enable_ckip() 後才載入
         self._ckip_ws = None
         self._ckip_boundaries: set[int] = set()
+        self.strict_ckip: bool = False  # Design 3b：繁化姬+CKIP 模式下啟用詞界守門
 
     # ── 建立 ────────────────────────────────────────────────────────────
 
@@ -127,11 +129,47 @@ class PostProcessor:
 
         # 載入既有測試型 corrections（優先），過濾過於激進的單字條目
         tested: dict[str, str] = {}
+        layer2_blocklist: frozenset = frozenset()
+        seam_threshold: int = 0
         p = Path(corrections_path)
         if p.exists():
             data = json.loads(p.read_text(encoding="utf-8"))
             raw = data.get("corrections", data)
             tested = {k: v for k, v in raw.items() if len(k) >= 2}
+            layer2_blocklist = frozenset(data.get("layer2_blocklist", []))
+            seam_threshold = int(data.get("layer2_seam_threshold", 0))
+
+        # 從 generated（Layer 2）移除 blocklist 詞條；tested（Layer 1）不受影響
+        if layer2_blocklist:
+            generated = {k: v for k, v in generated.items() if k not in layer2_blocklist}
+
+        # Direction 1：接縫評分（Generation-time seam scoring）
+        # gen_seam(wrong) = suffix_freq[wrong[-2]] × prefix_freq[wrong[-1]]
+        # 衡量「wrong 末二字作為跨詞接縫的統計頻率」；只計算 2-3 字規則
+        suffix_freq: Counter = Counter(hw[-1] for hw in moe_headwords if len(hw) >= 2)
+        prefix_freq: Counter = Counter(hw[0]  for hw in moe_headwords if len(hw) >= 2)
+
+        def _gen_seam(wrong: str) -> int:
+            if len(wrong) < 2 or len(wrong) > 3:
+                return 0
+            return suffix_freq.get(wrong[-2], 0) * prefix_freq.get(wrong[-1], 0)
+
+        seam_scored: dict[str, tuple[str, int]] = {
+            k: (v, _gen_seam(k)) for k, v in generated.items()
+        }
+        # 全部有效分數，按分數降序排列，供 write_seam_report() 使用
+        self._seam_scores: list[tuple[int, str, str]] = sorted(
+            ((s, k, v) for k, (v, s) in seam_scored.items() if s > 0),
+            reverse=True,
+        )
+        self._seam_threshold: int = seam_threshold
+        self._seam_excluded: dict[str, tuple[str, int]] = {}
+
+        if seam_threshold > 0:
+            self._seam_excluded = {
+                k: (v, s) for k, (v, s) in seam_scored.items() if s >= seam_threshold
+            }
+            generated = {k: v for k, v in generated.items() if k not in self._seam_excluded}
 
         # tested 優先覆蓋 generated；記錄 manual keys（Layer 1，不做 bigram 保護）
         manual_keys: frozenset = frozenset(tested.keys())
@@ -212,6 +250,7 @@ class PostProcessor:
             for w in words:
                 starts.add(pos)
                 pos += len(w)
+            starts.add(pos)  # text-end 視為詞界，確保末尾匹配不被誤擋
             return starts
         except Exception:
             return set()
@@ -239,7 +278,8 @@ class PostProcessor:
         """Single-pass 最長匹配替換：每個位置只處理一次，避免連鎖修改。
         Layer 1（corrections.json）不做 bigram 邊界檢查（手動驗證規則，優先且無條件套用）。
         Layer 2/3（MOE 生成 + TWVariants）做 bigram 邊界保護；
-          啟用 CKIP 時採雙重確認：bigram AND CKIP 皆認為跨界才跳過，任一放行則套用。
+          Design 3a：bigram 攔截時，CKIP 覆蓋需同時滿足（bigram 跨詞 AND 替換目標為完整詞）。
+          Design 3b（strict_ckip=True）：無 bigram 時，CKIP 詞界對齊才允許套用。
         """
         if self._ckip_ws is not None:
             self._ckip_boundaries = self._compute_ckip_boundaries(text)
@@ -274,20 +314,27 @@ class PostProcessor:
                     elif end < n and (wrong[-1] + text[end]) in self._bigrams:
                         blocked_by = f"lookahead:{wrong[-1]+text[end]}"
                     if blocked_by:
-                        # 雙重確認：CKIP 未啟用 OR CKIP 確認 bigram 真實存在於同一詞內 → 才真的跳過
-                        # lookbehind：i 不是詞起點 → text[i-1] 和 text[i] 同詞 → bigram 成立
-                        # lookahead ：end 不是詞起點 → text[end-1] 和 text[end] 同詞 → bigram 成立
-                        ckip_confirms = (
-                            self._ckip_ws is None or
-                            self._ckip_bigram_is_real(blocked_by, i, end)
-                        )
-                        if ckip_confirms:
+                        # Design 3a：CKIP 覆蓋 bigram 需同時滿足雙條件：
+                        #   (1) bigram 跨詞（bigram 兩端分屬不同 CKIP 詞）
+                        #   (2) 替換目標為完整 CKIP 詞（i 和 end 皆為詞界）
+                        can_override = False
+                        if self._ckip_ws is not None:
+                            bigram_is_cross = not self._ckip_bigram_is_real(blocked_by, i, end)
+                            match_is_word = (
+                                i in self._ckip_boundaries and
+                                end in self._ckip_boundaries and
+                                not self._ckip_cross_boundary(i, end)
+                            )
+                            can_override = bigram_is_cross and match_is_word
+                        if not can_override:
                             key = (wrong, right)
                             bl = self._blocked.setdefault(key, [])
                             if len(bl) < 3:
-                                bl.append(f"{snippet}  [{blocked_by}]")
+                                tag = (f"3a-bigram-wins:{blocked_by}"
+                                       if self._ckip_ws is not None else blocked_by)
+                                bl.append(f"{snippet}  [{tag}]")
                             continue
-                        # CKIP 判定不跨詞界 → 覆蓋 bigram 保護，套用修正
+                        # CKIP 雙重確認通過 → 覆蓋 bigram 保護，套用修正
                         out.append(right)
                         key = (wrong, right)
                         snippets = self._applied.setdefault(key, [])
@@ -296,6 +343,16 @@ class PostProcessor:
                         i = end
                         matched = True
                         break
+                    # Design 3b（strict_ckip）：無 bigram 保護時，要求 CKIP 詞界對齊才套用
+                    if self._ckip_ws is not None and self.strict_ckip:
+                        if (i not in self._ckip_boundaries or
+                                end not in self._ckip_boundaries or
+                                self._ckip_cross_boundary(i, end)):
+                            key = (wrong, right)
+                            bl = self._blocked.setdefault(key, [])
+                            if len(bl) < 3:
+                                bl.append(f"{snippet}  [3b-align-fail]")
+                            continue
                     out.append(right)
                     key = (wrong, right)
                     snippets = self._applied.setdefault(key, [])
@@ -343,7 +400,39 @@ class PostProcessor:
         with open(path, mode, encoding="utf-8") as f:
             f.write("".join(lines))
 
+    def write_seam_report(self, path: str, top_n: int = 30) -> None:
+        """輸出 Direction 1 接縫評分報告（每次 PostProcessor 初始化後呼叫一次）。"""
+        lines: list[str] = ["# Direction 1 接縫評分報告\n\n"]
+        θ = self._seam_threshold
+        lines.append(f"- layer2_seam_threshold (θ) = {θ:,}\n")
+        lines.append(f"- 模式：{'過濾（θ>0）' if θ > 0 else 'logging-only（θ=0，不過濾）'}\n")
+        lines.append(f"- 有非零評分的 2-3 字規則數：{len(self._seam_scores):,}\n")
+        if θ > 0:
+            lines.append(f"- 本次排除規則數：{len(self._seam_excluded):,}\n")
+        lines.append("\n")
+
+        if self._seam_excluded:
+            lines.append("## 已排除規則（score ≥ θ）\n\n")
+            lines.append("| wrong | right | gen_seam |\n|-------|-------|----------|\n")
+            for k, (v, s) in sorted(self._seam_excluded.items(), key=lambda x: -x[1][1]):
+                lines.append(f"| `{k}` | `{v}` | {s:,} |\n")
+            lines.append("\n")
+
+        lines.append(f"## 前 {top_n} 高分規則（logging-only 候選）\n\n")
+        lines.append("| wrong | right | gen_seam | 狀態 |\n|-------|-------|----------|------|\n")
+        for s, k, v in self._seam_scores[:top_n]:
+            status = "excluded" if k in self._seam_excluded else ("blocklist" if False else "active")
+            lines.append(f"| `{k}` | `{v}` | {s:,} | {status} |\n")
+
+        Path(path).write_text("".join(lines), encoding="utf-8")
+        print(f"✓ Direction 1 接縫評分報告：{path}")
+
     # ── 統計 ────────────────────────────────────────────────────────────
 
     def stats(self) -> str:
-        return f"corrections: {len(self._corrections):,} 條"
+        seam_info = (
+            f"，接縫閾值 θ={self._seam_threshold:,}"
+            f"{'（過濾中）' if self._seam_threshold > 0 else '（logging-only）'}"
+            if hasattr(self, "_seam_threshold") else ""
+        )
+        return f"corrections: {len(self._corrections):,} 條{seam_info}"
