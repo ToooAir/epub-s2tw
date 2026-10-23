@@ -56,6 +56,7 @@ epub-s2tw/
 ├── translator.py            # Google Translate 包裝層（快取、批次、並行、兩種模式）
 ├── zhconvert_translator.py  # 繁化姬包裝層（zhconvert.org），與 translator.py 介面相容
 ├── postprocess.py           # 後處理層：修正 Google 的繁體歧義字與已知翻譯錯誤
+├── llm_review.py            # --llm-review：Claude 分歧裁決 + 名字檢查，產生本書專用修正
 ├── analyze_rules.py         # 後處理規則品質分析：解析 consistency logs、計算接縫評分、輸出 rule_analysis.md
 ├── dict-revised.json.xz     # 教育部國語辭典（162,887 詞頭），後處理規則生成來源
 ├── STCharacters.txt         # OpenCC 單字對照表（簡→繁，含多選項）
@@ -125,6 +126,7 @@ python translate_epub.py -d ./books
 | `--no-protect-entities` | 停用譯前高頻人名實體保護機制（預設為啟用）|
 | `--log-consistency` | 輸出一致性修正報告 (`_consistency.txt`)|
 | `--ckip` | 啟用 CKIP albert-tiny 雙重詞界確認（需安裝 `ckip-transformers`）|
+| `--llm-review` | （需 `--zhconvert`）以 Claude 校對人名與斷詞錯誤，輸出 `_llm_review.md`；需安裝 Claude Code CLI，分歧裁決另需系統 `opencc` |
 | `-v` | 顯示每個 XHTML 的處理進度 |
 | `--dry-run` | 只列出會處理的檔案，不實際翻譯 |
 | `--clear-cache` | 清除全域快取 `.translate_cache.json`（僅 Google NMT 模式使用）|
@@ -146,7 +148,19 @@ python translate_epub.py -d ./books --free -o ./output --log-consistency --ckip
 
 # 繁化姬 + CKIP strict 守門（推薦組合，最低誤傷率）
 python translate_epub.py -d ./books --zhconvert -o ./output --log-consistency --ckip
+
+# 再加 LLM 校對（每本約 2–3 分鐘，使用 Claude 訂閱額度）
+python translate_epub.py -d ./books --zhconvert -o ./output --log-consistency --ckip --llm-review
 ```
+
+### LLM 校對（`--llm-review`）
+
+繁化姬與後處理完成後，以 `claude -p`（Claude Code CLI 非互動模式，用訂閱額度、免 API key）做兩種檢查：
+
+1. **分歧裁決**：繁化姬與系統 `opencc -c s2twp.json` 不一致處交給 Claude 判斷，抓斷詞錯誤與殘留簡體（樹乾髮出→樹幹發出、担任→擔任）。在地化改寫（玩意兒→東西）視為正確。
+2. **名字檢查**：含一簡對多繁字的高頻詞，抓兩個轉換器都錯的專名（烏裡朵拉→烏里朵拉）與前後不一致（春鬥/春斗）。
+
+規則只套用在該本書、不寫入 `corrections.json`；須通過 s2t 合法字檢查，且不會改到原文不是該詞的地方，否則列為待審。`_llm_review.md` 列出每條已套用規則的修正前後例句與待審項目，通用的規則可手動加入 `corrections.json`。Claude 呼叫失敗時只警告，該書照常輸出。
 
 ## 後處理層
 

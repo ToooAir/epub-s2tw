@@ -491,7 +491,8 @@ class EpubProcessor:
         opf_dir = opf_candidates[0].rsplit("/", 1)[0] + "/" if opf_candidates else ""
         self._epub_root = opf_dir  # e.g. "OEBPS/"
 
-    def translate(self, translator, postprocessor=None, verbose: bool = False, report_path: str | None = None, protect_entities: bool = True):
+    def translate(self, translator, postprocessor=None, verbose: bool = False, report_path: str | None = None, protect_entities: bool = True,
+                  llm_review_path: str | None = None):
         """翻譯整本 EPUB 的 HTML 文件與 metadata。"""
         docs = [i for i in self.book.get_items()
                 if i.get_type() == ebooklib.ITEM_DOCUMENT
@@ -588,6 +589,8 @@ class EpubProcessor:
                     continue
         s2t = postprocessor.s2t_map if postprocessor else {}
         self._consistency_pass(docs, s2t_map=s2t, report_path=report_path)
+        if llm_review_path:
+            self._llm_review_pass(docs, postprocessor, llm_review_path)
 
         if report_path and entities:
             try:
@@ -981,6 +984,47 @@ class EpubProcessor:
         for wrong, right in list(normalization.items())[:5]:
             tqdm.write(f"       {wrong} → {right}")
 
+        # ── 3. 套用回每個 item（含 NCX），同時收集 debug 資訊 ──────────
+        sorted_norm = sorted(normalization.items(), key=lambda x: -len(x[0]))
+        debug_hits = self._apply_replacements(docs, normalization)
+
+        # ── 4. 寫出報告檔案 ─────────────────────────────────────────
+        if report_path:
+            import os
+            try:
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(f"=== 一致性修正報告 ({len(normalization)} 組) ===\n\n")
+                    for idx, (wrong, right) in enumerate(sorted_norm, 1):
+                        hits = debug_hits.get(wrong, [])
+                        source_str = wrong_to_source.get(wrong, "unknown")
+                        f.write(f"[{idx:02d}] {wrong} → {right}  (source: {source_str}, {len(hits)} 個例句)\n")
+                        for before, after in hits:
+                            f.write(f"  修正前：…{before}…\n")
+                            f.write(f"  修正後：…{after}…\n")
+                        f.write("\n")
+                tqdm.write(f"  📄 一致性報告已輸出：{os.path.basename(report_path)}")
+            except Exception as e:
+                tqdm.write(f"  ⚠️  報告寫入失敗：{e}")
+
+    def _llm_review_pass(self, docs, postprocessor, review_path: str):
+        """繁化姬模式選用：以 Claude 校對（llm_review.py），只把通過驗證的規則套用到本書。"""
+        import os
+        import llm_review
+        if not self._text_pairs:
+            return
+        try:
+            moe = getattr(postprocessor, "moe_words", None) or frozenset()
+            rules, review, notes = llm_review.review_book(
+                self._text_pairs, llm_review.load_s2t(), moe, log=tqdm.write)
+        except Exception as e:
+            tqdm.write(f"  ⚠️  LLM 校對失敗，略過：{e}")
+            return
+        hits = self._apply_replacements(docs, rules) if rules else {}
+        llm_review.write_report(review_path, rules, review, notes, hits)
+        tqdm.write(f"  📄 LLM 校對報告：{os.path.basename(review_path)}")
+
+    def _apply_replacements(self, docs, normalization: dict[str, str]) -> dict[str, list[tuple[str, str]]]:
+        """把 wrong→right 套用到每個 XHTML 文字節點與 NCX；回傳每組最多 5 個 (修正前, 修正後) 例句。"""
         # ── 3. 套用回每個 item，同時收集 debug 資訊 ──────────────────
         tag_re   = re.compile(r"<[^>]+>")
         sorted_norm = sorted(normalization.items(), key=lambda x: -len(x[0]))
@@ -1068,23 +1112,8 @@ class EpubProcessor:
             except Exception:
                 continue
 
-        # ── 4. 寫出報告檔案 ─────────────────────────────────────────
-        if report_path:
-            import os
-            try:
-                with open(report_path, "w", encoding="utf-8") as f:
-                    f.write(f"=== 一致性修正報告 ({len(normalization)} 組) ===\n\n")
-                    for idx, (wrong, right) in enumerate(sorted_norm, 1):
-                        hits = debug_hits.get(wrong, [])
-                        source_str = wrong_to_source.get(wrong, "unknown")
-                        f.write(f"[{idx:02d}] {wrong} → {right}  (source: {source_str}, {len(hits)} 個例句)\n")
-                        for before, after in hits:
-                            f.write(f"  修正前：…{before}…\n")
-                            f.write(f"  修正後：…{after}…\n")
-                        f.write("\n")
-                tqdm.write(f"  📄 一致性報告已輸出：{os.path.basename(report_path)}")
-            except Exception as e:
-                tqdm.write(f"  ⚠️  報告寫入失敗：{e}")
+        return debug_hits
+
 
     # NMT 可合法省略的虛詞與語氣助詞，不觸發截斷修復
     _DROPPABLE = frozenset(

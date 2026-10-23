@@ -20,6 +20,7 @@ translate_epub.py — 將簡體中文 EPUB 翻譯為繁體中文
 """
 
 import argparse
+import shutil
 import os
 import subprocess
 import sys
@@ -65,6 +66,7 @@ def process_file(
     verbose: bool = False,
     log_consistency: bool = False,
     protect_entities: bool = True,
+    llm_review: bool = False,
 ) -> bool:
     stem     = input_path.stem.replace("_zhTW", "").strip()
     new_stem = to_trad_filename(stem) if rename else stem
@@ -80,7 +82,9 @@ def process_file(
     try:
         proc = EpubProcessor(str(input_path))
         report_path = output_dir / f"{new_stem}_consistency.txt" if log_consistency else None
-        proc.translate(translator, postprocessor=postprocessor, verbose=verbose, report_path=str(report_path) if report_path else None, protect_entities=protect_entities)
+        llm_review_path = output_dir / f"{new_stem}_llm_review.md" if llm_review else None
+        proc.translate(translator, postprocessor=postprocessor, verbose=verbose, report_path=str(report_path) if report_path else None, protect_entities=protect_entities,
+                       llm_review_path=str(llm_review_path) if llm_review_path else None)
         proc.save(str(out_path))
         if log_consistency and report_path:
             if translator._fallback_log:
@@ -130,7 +134,15 @@ def main():
                         help="停用譯前高頻人名實體保護機制（預設為啟用）")
     parser.add_argument("--zhconvert", action="store_true",
                         help="使用繁化姬 API（zhconvert.org）取代 Google NMT，無需 API Key")
+    parser.add_argument("--llm-review", action="store_true",
+                        help="（需 --zhconvert）以 Claude（claude -p，用訂閱額度）校對人名與斷詞錯誤，輸出 *_llm_review.md")
     args = parser.parse_args()
+
+    if args.llm_review:
+        if not args.zhconvert:
+            parser.error("--llm-review 目前只支援 --zhconvert 模式")
+        if not shutil.which("claude"):
+            parser.error("--llm-review 需要 Claude Code CLI（找不到 claude 指令）")
 
     if args.clear_cache:
         cache_file = Path(".translate_cache.json")
@@ -213,7 +225,8 @@ def main():
             ok = process_file(f, output_dir, translator, postprocessor,
                               rename=not args.no_rename, verbose=args.verbose,
                               log_consistency=args.log_consistency,
-                              protect_entities=not args.no_protect_entities)
+                              protect_entities=not args.no_protect_entities,
+                              llm_review=args.llm_review)
             if ok:
                 success += 1
             else:

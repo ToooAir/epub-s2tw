@@ -18,3 +18,9 @@ output/
 
 # Memory
 memory/
+
+# 生成的分析報告
+rule_analysis*.md
+seam_report.md
+# 評估集（含書籍內文快取）
+eval/
