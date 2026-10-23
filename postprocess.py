@@ -365,7 +365,8 @@ class PostProcessor:
                 out.append(text[i])
                 i += 1
         result = "".join(out)
-        return re.sub(r'…+', '……', result)
+        # 只補 Google 壓縮成的孤立單個 …；保留作者刻意的長省略號（…………）
+        return re.sub(r'(?<!…)…(?!…)', '……', result)
 
     def clear_applied_log(self):
         self._applied.clear()
