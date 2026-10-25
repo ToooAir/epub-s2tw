@@ -450,7 +450,7 @@ def process_xhtml(
                 final_html = new_html
             _replace_inner_html(tag, final_html)
             if pairs_collector is not None:
-                orig_text = BeautifulSoup(orig_html, "html.parser").get_text()
+                orig_text = BeautifulSoup(_restore_opaque_sentinels(orig_html, mapping), "html.parser").get_text()
                 tgt_text  = BeautifulSoup(final_html, "html.parser").get_text()
                 if orig_text.strip():
                     pairs_collector.append((orig_text, tgt_text))
