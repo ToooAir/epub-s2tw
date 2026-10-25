@@ -34,6 +34,7 @@ def adjudicate(rows: list[dict], model: str, effort: str) -> dict[int, dict]:
     class Verdict(BaseModel):
         id: int
         verdict: Literal["zh", "cc", "both", "neither", "mixed"]
+        wrong: str
         correct: str
         reason: str
 
