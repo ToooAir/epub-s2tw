@@ -8,6 +8,7 @@ __pycache__/
 
 # 輸出與原始書檔
 output/
+output_llm_review/
 *.epub
 
 # 環境變數
