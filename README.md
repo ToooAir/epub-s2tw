@@ -160,7 +160,19 @@ python translate_epub.py -d ./books --zhconvert -o ./output --log-consistency --
 1. **分歧裁決**：繁化姬與系統 `opencc -c s2twp.json` 不一致處交給 Claude 判斷，抓斷詞錯誤與殘留簡體（樹乾髮出→樹幹發出、担任→擔任）。在地化改寫（玩意兒→東西）視為正確。
 2. **名字檢查**：含一簡對多繁字的高頻詞，抓兩個轉換器都錯的專名（烏裡朵拉→烏里朵拉）與前後不一致（春鬥/春斗）。
 
-規則只套用在該本書、不寫入 `corrections.json`；須通過 s2t 合法字檢查，且不會改到原文不是該詞的地方，否則列為待審。`_llm_review.md` 列出每條已套用規則的修正前後例句與待審項目，通用的規則可手動加入 `corrections.json`。Claude 呼叫失敗時只警告，該書照常輸出。
+規則只套用在該本書、不寫入 `corrections.json`。每條規則套用前都要通過驗證，否則列為待審、不套用：
+
+- 名字規則：每個字須是原文字的合法 s2t 轉換，且不會改到原文不是該詞的地方。
+- 採用 OpenCC 寫法的規則：改完的文字須出現在該段的 OpenCC 輸出中。
+- LLM 自寫的修正：須與簡體原文逐字對得上，沒有多出或漏掉的字。
+
+`_llm_review.md` 列出每條已套用規則的修正前後例句與待審項目，通用的規則可手動加入 `corrections.json`。Claude 呼叫失敗（例如用量達上限）時只警告，該書照常輸出、不做校對。
+
+**需求與替代方案：**
+
+- 需要已登入的 [Claude Code](https://claude.com/claude-code)（Pro 以上訂閱），不需要 API key，用量計入訂閱額度（每本書約等值 $0.2–0.7）。
+- 不開 `--llm-review` 時，整條流程完全不依賴 Claude。
+- 所有 LLM 呼叫都只經過 `llm_review.py` 的 `claude_cli()`，要改用其他模型可從這個函式替換。換模型後建議先用評估集驗證判斷品質：`compare_converters.py` 產生分歧清單、人工標註成 `eval/labels.json` 後，`llm_adjudicate.py` 會依標註評分（`eval/` 含書籍內文，不納入版本控制，需自行建立）。較弱的模型可能改壞文字；上述驗證能擋下多數錯誤，但會讓待審項目變多。
 
 ## 後處理層
 
